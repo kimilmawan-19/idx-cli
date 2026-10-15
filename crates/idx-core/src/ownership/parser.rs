@@ -496,9 +496,35 @@ fn is_id_number_like(value: &str) -> bool {
         && trimmed.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
 }
 
+/// A type code (`CP`, `ID`) or, in the registers with an INVESTOR
+/// CLASSIFICATION column, a classification word (`Corporate`). Missing the
+/// word shifted it into nationality and the real nationality into domicile.
 fn is_investor_type_marker(value: &str) -> bool {
     let trimmed = value.trim();
-    !trimmed.is_empty() && trimmed.len() <= 4 && trimmed.chars().all(|ch| ch.is_ascii_uppercase())
+    if !trimmed.is_empty()
+        && trimmed.len() <= 4
+        && trimmed.chars().all(|ch| ch.is_ascii_uppercase())
+    {
+        return true;
+    }
+    const CLASSIFICATIONS: &[&str] = &[
+        "CORPORATE",
+        "INDIVIDUAL",
+        "INSURANCE",
+        "PENSION FUND",
+        "MUTUAL FUND",
+        "FINANCIAL INSTITUTION",
+        "FINANCIAL INSTITUTIONAL",
+        "SECURITIES COMPANY",
+        "FOUNDATION",
+        "OTHERS",
+    ];
+    let upper = trimmed
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    CLASSIFICATIONS.contains(&upper.as_str())
 }
 
 fn is_locality_marker(value: &str) -> bool {
@@ -659,6 +685,51 @@ mod tests {
         assert_eq!(row.holdings_scrip, "0");
         assert_eq!(row.total_holding_shares, "3.200.142.830");
         assert_eq!(row.percentage, "41,10");
+    }
+
+    #[test]
+    fn test_parse_stext_xml_spaced_excerpt_reads_classification_words() {
+        let xml = include_str!("../../tests/fixtures/ksei_above1_spaced_stext_excerpt.xml");
+
+        let rows = parse_stext_xml(xml).expect("failed to parse spaced above1 excerpt XML");
+        assert_eq!(rows.len(), 1);
+
+        let row = &rows[0];
+        assert_eq!(row.date, "29-May-2026");
+        assert_eq!(row.share_code, "AADI");
+        assert_eq!(row.investor_name, "PERSADA CAPITAL INVESTAMA");
+        assert_eq!(row.investor_type, "Corporate");
+        assert_eq!(row.local_foreign, "D");
+        assert_eq!(row.nationality, "INDONESIA");
+        assert_eq!(row.domicile, "");
+        assert_eq!(row.percentage, "41,10");
+    }
+
+    #[test]
+    fn test_parse_row_segments_classification_word_with_domicile() {
+        let texts: Vec<String> = [
+            "29-May-2026 BBCA",
+            "BANK CENTRAL ASIA Tbk",
+            "FTAG INVESTMENT BANK LTD",
+            "Financial Institutional",
+            "A",
+            "MALAYSIA",
+            "MALAYSIA",
+            "1.000.000",
+            "0",
+            "1.000.000",
+            "1,20",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let row = parse_row_segments(&texts);
+        assert_eq!(row.investor_name, "FTAG INVESTMENT BANK LTD");
+        assert_eq!(row.investor_type, "Financial Institutional");
+        assert_eq!(row.local_foreign, "A");
+        assert_eq!(row.nationality, "MALAYSIA");
+        assert_eq!(row.domicile, "MALAYSIA");
     }
 
     #[test]
