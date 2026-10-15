@@ -8,9 +8,9 @@
         "forwardPriceToEPS": 11.8,
         "priceToBookRatio": 1.7,
         "roe": 18.4,
-        "profitMargin": 22.1,
-        "revenueGrowthRate": 9.4,
-        "earningsGrowthRate": 8.1,
+        "profitMargin": 0.221,
+        "revenueGrowthRate": 0.094,
+        "earningsGrowthRate": 0.081,
         "debtToEquityRatio": 0.4,
         "currentRatio": 1.3
       }

@@ -85,23 +85,11 @@ pub(super) fn parse_fundamentals(
         trailing_pe: best_metric_value(metrics, |metric| metric.price_to_earnings_ratio),
         forward_pe: best_metric_value(metrics, |metric| metric.forward_price_to_eps),
         price_to_book: best_metric_value(metrics, |metric| metric.price_to_book_ratio),
-        return_on_equity: best_metric_value(metrics, |metric| normalize_percentish(metric.roe)),
-        profit_margins: best_metric_value(metrics, |metric| {
-            normalize_percentish(metric.profit_margin.or(metric.net_margin))
-        }),
-        return_on_assets: best_metric_value(metrics, |metric| {
-            normalize_percentish(metric.roa_ttm.or(metric.return_on_asset_current))
-        }),
-        revenue_growth: best_metric_value(metrics, |metric| {
-            normalize_percentish(metric.revenue_ytd_ytd.or(metric.revenue_growth_rate))
-        }),
-        earnings_growth: best_metric_value(metrics, |metric| {
-            normalize_percentish(
-                metric
-                    .net_income_ytd_ytd_growth_rate
-                    .or(metric.earnings_growth_rate),
-            )
-        }),
+        return_on_equity: best_metric_value(metrics, return_on_equity),
+        profit_margins: best_metric_value(metrics, profit_margin),
+        return_on_assets: best_metric_value(metrics, return_on_assets),
+        revenue_growth: best_metric_value(metrics, revenue_growth),
+        earnings_growth: best_metric_value(metrics, earnings_growth),
         debt_to_equity: best_metric_value(metrics, |metric| metric.debt_to_equity_ratio),
         current_ratio: best_metric_value(metrics, |metric| {
             sanitize_current_ratio(metric.current_ratio)
@@ -121,15 +109,11 @@ fn metric_has_supported_values(metric: &IndustryMetric) -> bool {
             .forward_price_to_eps
             .filter(|value| value.is_finite()),
         metric.price_to_book_ratio.filter(|value| value.is_finite()),
-        normalize_percentish(metric.roe),
-        normalize_percentish(metric.profit_margin.or(metric.net_margin)),
-        normalize_percentish(metric.roa_ttm.or(metric.return_on_asset_current)),
-        normalize_percentish(metric.revenue_ytd_ytd.or(metric.revenue_growth_rate)),
-        normalize_percentish(
-            metric
-                .net_income_ytd_ytd_growth_rate
-                .or(metric.earnings_growth_rate),
-        ),
+        return_on_equity(metric),
+        profit_margin(metric),
+        return_on_assets(metric),
+        revenue_growth(metric),
+        earnings_growth(metric),
         metric
             .debt_to_equity_ratio
             .filter(|value| value.is_finite()),
@@ -180,16 +164,58 @@ fn metric_period_priority(period: Option<&str>) -> i32 {
     }
 }
 
-fn normalize_percentish(value: Option<f64>) -> Option<f64> {
-    value.and_then(|number| {
-        if !number.is_finite() {
-            None
-        } else if number.abs() > 1.0 {
-            Some(number / 100.0)
-        } else {
-            Some(number)
-        }
-    })
+// MSN's scale depends on the field and the row (checked against live key
+// ratios for BBCA, BBRI, TLKM, ASII and GOTO): ROE and ROA are always
+// percents; on the TTM row margin and growth fields are fractions, on
+// Annual and quarterly rows percents. Guessing from the magnitude read a
+// -0.75% ROA as -75% and +100% earnings growth as +1%.
+
+/// A percent-scale value (`21.8` = 21.8%) as a fraction.
+fn from_percent(value: Option<f64>) -> Option<f64> {
+    value
+        .filter(|number| number.is_finite())
+        .map(|number| number / 100.0)
+}
+
+/// A margin or growth value: a fraction on the TTM row, a percent elsewhere.
+fn from_row_scale(metric: &IndustryMetric, value: Option<f64>) -> Option<f64> {
+    let ttm = metric
+        .fiscal_period_type
+        .as_deref()
+        .is_some_and(|period| period.trim().eq_ignore_ascii_case("TTM"));
+    if ttm {
+        value.filter(|number| number.is_finite())
+    } else {
+        from_percent(value)
+    }
+}
+
+fn return_on_equity(metric: &IndustryMetric) -> Option<f64> {
+    from_percent(metric.roe)
+}
+
+fn profit_margin(metric: &IndustryMetric) -> Option<f64> {
+    from_row_scale(metric, metric.profit_margin.or(metric.net_margin))
+}
+
+fn return_on_assets(metric: &IndustryMetric) -> Option<f64> {
+    from_percent(metric.roa_ttm.or(metric.return_on_asset_current))
+}
+
+fn revenue_growth(metric: &IndustryMetric) -> Option<f64> {
+    from_row_scale(
+        metric,
+        metric.revenue_ytd_ytd.or(metric.revenue_growth_rate),
+    )
+}
+
+fn earnings_growth(metric: &IndustryMetric) -> Option<f64> {
+    from_row_scale(
+        metric,
+        metric
+            .net_income_ytd_ytd_growth_rate
+            .or(metric.earnings_growth_rate),
+    )
 }
 
 fn sanitize_current_ratio(value: Option<f64>) -> Option<f64> {
@@ -954,6 +980,45 @@ mod tests {
             err.to_string(),
             "parse error: screener returned no priced stocks"
         );
+    }
+
+    #[test]
+    fn parse_fundamentals_reads_each_field_on_its_own_scale() {
+        // GOTO's live TTM row (2026-10): ROE/ROA in percent, margin and
+        // growth as fractions.
+        let raw: Vec<KeyRatios> = serde_json::from_str(
+            r#"[{ "companyMetrics": [
+                { "year": "2025", "fiscalPeriodType": "Annual", "roe": -2.9938,
+                  "netMargin": -6.4712, "revenueYTDYTD": 15.2736 },
+                { "year": "2026", "fiscalPeriodType": "TTM", "roe": 0.0047,
+                  "profitMargin": 0.0001, "roaTTM": -0.7494,
+                  "revenueYTDYTD": 0.2418, "netIncomeYTDYTDGrowthRate": 1.0006 }
+            ] }]"#,
+        )
+        .expect("key ratios should deserialize");
+
+        let fundamentals = parse_fundamentals(&raw, None).expect("fundamentals parse");
+        let close = |actual: Option<f64>, expected: f64| {
+            let actual = actual.expect("value present");
+            assert!((actual - expected).abs() < 1e-9, "{actual} != {expected}");
+        };
+        close(fundamentals.return_on_equity, 0.000047);
+        close(fundamentals.return_on_assets, -0.007494);
+        close(fundamentals.profit_margins, 0.0001);
+        close(fundamentals.revenue_growth, 0.2418);
+        close(fundamentals.earnings_growth, 1.0006);
+
+        // Annual rows are percents throughout.
+        let annual: Vec<KeyRatios> = serde_json::from_str(
+            r#"[{ "companyMetrics": [
+                { "year": "2025", "fiscalPeriodType": "Annual", "netMargin": -6.4712,
+                  "revenueYTDYTD": 15.2736 }
+            ] }]"#,
+        )
+        .expect("key ratios should deserialize");
+        let fundamentals = parse_fundamentals(&annual, None).expect("fundamentals parse");
+        close(fundamentals.profit_margins, -0.064712);
+        close(fundamentals.revenue_growth, 0.152736);
     }
 
     #[test]
