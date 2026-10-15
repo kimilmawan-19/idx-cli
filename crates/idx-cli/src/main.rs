@@ -39,6 +39,19 @@ fn run() -> Result<(), IdxError> {
     runtime::set_quiet(cli.quiet);
     let config = match IdxConfig::load_with_cli(&cli) {
         Ok(config) => config,
+        // `config` must still run when the configuration is broken: it is
+        // how the file gets repaired (`config set`, `config path`).
+        Err(_) if matches!(cli.command, Commands::Config(_)) => {
+            let format = bootstrap_output_format(&cli);
+            output::json::configure(format, config::stdout_is_terminal());
+            if let Commands::Config(cfg) = &cli.command
+                && let Err(err) = cli::config::handle(cfg, &format)
+            {
+                emit_error(&err, &format);
+                return Err(err);
+            }
+            return Ok(());
+        }
         Err(err) => {
             emit_error(&err, &bootstrap_output_format(&cli));
             return Err(err);
@@ -73,7 +86,7 @@ fn run() -> Result<(), IdxError> {
             }
         }
         Commands::Config(cfg) => {
-            if let Err(err) = cli::config::handle(cfg) {
+            if let Err(err) = cli::config::handle(cfg, &config.output) {
                 emit_error(&err, &config.output);
                 return Err(err);
             }

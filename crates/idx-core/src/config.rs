@@ -251,7 +251,11 @@ pub fn get_config_value(key: &str) -> Result<Option<String>, IdxError> {
         };
         cur = next;
     }
-    Ok(Some(cur.to_string().trim_matches('"').to_string()))
+    // A string as written (not TOML-escaped: `C:\x` stays `C:\x`).
+    Ok(Some(match cur.as_str() {
+        Some(text) => text.to_string(),
+        None => cur.to_string(),
+    }))
 }
 
 /// Known configuration keys and their valid values
