@@ -48,8 +48,10 @@ impl QuoteProvider for MsnProvider {
 impl FundamentalsProvider for MsnProvider {
     fn fundamentals(&self, symbol: &str) -> Result<Fundamentals, IdxError> {
         let ratios = self.client.fetch_key_ratios(symbol)?;
-        let quote = self.client.fetch_quotes(symbol)?;
-        parse_fundamentals(&ratios, quote.first())
+        // The quote only supplies market cap: a suspended or unpriced stock
+        // still has key ratios worth reporting.
+        let quotes = self.client.fetch_quotes(symbol).unwrap_or_default();
+        parse_fundamentals(&ratios, quotes.first())
     }
 }
 
