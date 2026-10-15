@@ -28,11 +28,23 @@ idx ownership search salim              # find investor names
 idx ownership changes --from 2026-08-31 --to 2026-09-30
 idx ownership concentration --top 20    # most concentrated stocks (by HHI)
 idx ownership cross-holders --min-tickers 3
-idx ownership graph BBCA --depth 2      # ownership network; --format dot for Graphviz
+idx ownership graph BBCA --depth 2      # ownership network, depth 1 to 4
 ```
 
+`search` also finds an investor by one of its aliases, and matches what you
+type literally (`%` and `"` are just characters).
+
 `changes` lists holders that are new, exited, increased or decreased between
-two releases. `ticker` also reports concentration: the top holder's share,
+two releases. Both dates are `YYYY-MM-DD` and must match a release you have
+(`idx ownership releases`). A holder with several spellings is counted once.
+
+`graph --format dot` writes Graphviz DOT, even when piped:
+
+```bash
+idx ownership graph BBCA --format dot | dot -Tsvg > bbca.svg
+```
+
+`ticker` also reports concentration: the top holder's share,
 the top three, the Herfindahl index (HHI) and the free float (shares held by
 holders below 1%).
 
