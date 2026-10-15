@@ -156,7 +156,7 @@ pub struct ChangesArgs {
 pub struct GraphArgs {
     /// Ticker code or entity name to start from.
     pub root: String,
-    /// Traversal depth (default 2).
+    /// Traversal depth, 1 to 4 (default 2).
     #[arg(long, default_value_t = 2)]
     pub depth: usize,
     /// Output format: table or dot (Graphviz).
