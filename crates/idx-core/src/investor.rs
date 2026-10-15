@@ -340,7 +340,6 @@ impl Investor {
                 imported_at: Utc::now().timestamp(),
             };
             let inserted_rows = db::write_ksei_release(&conn, &release, &holdings, force)?;
-            search::rebuild_fts(&conn)?;
             Ok((release, inserted_rows, ticker_ids.len()))
         })?;
 

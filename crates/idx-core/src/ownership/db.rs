@@ -3,11 +3,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 use directories::ProjectDirs;
-use rusqlite::{Connection, DatabaseName, params};
+use rusqlite::{Connection, params};
 
 use crate::config::get_config_value;
 use crate::error::IdxError;
-use crate::ownership::search;
 use crate::ownership::types::{
     BingHolding, ChangeRow, ChangeType, ConcentrationMetrics, CrossHolderRow, Entity,
     EntityHoldings, EntityTickerRow, FlowSignal, HolderRow, InstitutionalFlow, KseiHolding,
@@ -97,18 +96,6 @@ CREATE INDEX IF NOT EXISTS idx_bing_entity ON bing_holdings(entity_id);
 CREATE INDEX IF NOT EXISTS idx_bing_date ON bing_holdings(report_date);
 "#;
 
-/// Schema version 2: entity search index. Version 1 declared it as an
-/// external-content table over `entities`, which has no `aliases` column, so
-/// every read and rebuild failed. A standalone table owns its text instead.
-pub const SCHEMA_V2: &str = r#"
-DROP TABLE IF EXISTS entity_fts;
-CREATE VIRTUAL TABLE entity_fts USING fts5(
-    canonical_name,
-    aliases,
-    tokenize='trigram'
-);
-"#;
-
 /// Ensure ownership schema is migrated and ready for use.
 pub fn ensure_schema(conn: &Connection) -> Result<(), IdxError> {
     let user_version: i64 = conn
@@ -128,30 +115,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), IdxError> {
             .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
     }
 
-    // A read-only database (snapshot on a read-only filesystem) keeps the old
-    // index; search falls back to LIKE there.
-    if user_version < 2 && !conn.is_readonly(DatabaseName::Main).unwrap_or(false) {
-        migrate_v2(conn)?;
-    }
-
     Ok(())
-}
-
-fn migrate_v2(conn: &Connection) -> Result<(), IdxError> {
-    let db_err = |e: rusqlite::Error| IdxError::DatabaseError(e.to_string());
-    conn.execute_batch("SAVEPOINT schema_v2").map_err(db_err)?;
-    let result = (|| {
-        conn.execute_batch(SCHEMA_V2).map_err(db_err)?;
-        search::rebuild_fts(conn)?;
-        conn.pragma_update(None, "user_version", 2).map_err(db_err)
-    })();
-    match result {
-        Ok(()) => conn.execute_batch("RELEASE schema_v2").map_err(db_err),
-        Err(err) => {
-            let _ = conn.execute_batch("ROLLBACK TO schema_v2; RELEASE schema_v2");
-            Err(err)
-        }
-    }
 }
 
 /// Open ownership database connection and run idempotent schema migration.
@@ -1185,7 +1149,6 @@ pub fn manual_map(conn: &Connection, raw_name: &str, canonical_name: &str) -> Re
         )
         .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
-        search::rebuild_fts(conn)?;
         Ok(())
     })();
 
@@ -1256,7 +1219,6 @@ pub fn merge_entities(conn: &Connection, keep_id: i64, merge_id: i64) -> Result<
         conn.execute("DELETE FROM entities WHERE id = ?1", params![merge_id])
             .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
-        search::rebuild_fts(conn)?;
         Ok(())
     })();
 
