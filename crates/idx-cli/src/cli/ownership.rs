@@ -152,6 +152,12 @@ pub struct ChangesArgs {
     pub to: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum GraphFormat {
+    Table,
+    Dot,
+}
+
 #[derive(Debug, Args)]
 pub struct GraphArgs {
     /// Ticker code or entity name to start from.
@@ -159,9 +165,10 @@ pub struct GraphArgs {
     /// Traversal depth, 1 to 4 (default 2).
     #[arg(long, default_value_t = 2)]
     pub depth: usize,
-    /// Output format: table or dot (Graphviz).
-    #[arg(long, default_value = "table")]
-    pub format: String,
+    /// Graph format: table, or dot (Graphviz), which is written as DOT
+    /// even when stdout is piped [default: table, or JSON when piped]
+    #[arg(long, value_enum)]
+    pub format: Option<GraphFormat>,
 }
 
 #[derive(Debug, Args)]
@@ -262,7 +269,7 @@ fn handle_discover(
     config: &IdxConfig,
 ) -> Result<(), IdxError> {
     if args.limit == 0 {
-        return Err(IdxError::ParseError(
+        return Err(IdxError::InvalidInput(
             "--limit must be greater than 0".to_string(),
         ));
     }
@@ -569,6 +576,13 @@ fn print_flow_section(title: &str, rows: &[HolderRow]) {
 fn handle_graph(investor: &Investor, args: &GraphArgs, config: &IdxConfig) -> Result<(), IdxError> {
     let (nodes, edges) = investor.graph(&args.root, args.depth)?;
 
+    // An explicit --format dot is a request for Graphviz input, typically
+    // redirected to a file, so it is not replaced by JSON when piped.
+    if args.format == Some(GraphFormat::Dot) {
+        print!("{}", graph::format_graph_dot(&nodes, &edges));
+        return Ok(());
+    }
+
     if config.output.is_json() {
         #[derive(Serialize)]
         struct GraphOutput<'a> {
@@ -581,19 +595,8 @@ fn handle_graph(investor: &Investor, args: &GraphArgs, config: &IdxConfig) -> Re
         });
     }
 
-    match args.format.trim().to_lowercase().as_str() {
-        "table" => {
-            print!("{}", graph::format_graph_text(&nodes, &edges));
-            Ok(())
-        }
-        "dot" => {
-            print!("{}", graph::format_graph_dot(&nodes, &edges));
-            Ok(())
-        }
-        other => Err(IdxError::ParseError(format!(
-            "invalid --format '{other}', expected table|dot"
-        ))),
-    }
+    print!("{}", graph::format_graph_text(&nodes, &edges));
+    Ok(())
 }
 
 fn handle_changes(
@@ -734,13 +737,13 @@ fn handle_import(
     config: &IdxConfig,
 ) -> Result<(), IdxError> {
     if args.file.is_none() && args.url.is_none() && args.fetch_bing.is_none() {
-        return Err(IdxError::ParseError(
+        return Err(IdxError::InvalidInput(
             "provide one of: --file, --url, or --fetch-bing".to_string(),
         ));
     }
 
     if args.file.is_some() && args.url.is_some() {
-        return Err(IdxError::ParseError(
+        return Err(IdxError::InvalidInput(
             "--file and --url are mutually exclusive".to_string(),
         ));
     }

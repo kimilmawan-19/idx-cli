@@ -331,8 +331,19 @@ fn source_label(source: OwnershipSource) -> &'static str {
     }
 }
 
+/// A DOT quoted-string body: a trailing backslash or a raw newline in a
+/// holder name otherwise broke the generated file.
 fn escape_dot(value: &str) -> String {
-    value.replace('"', "\\\"")
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' | '\r' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -455,6 +466,12 @@ mod tests {
             assert!(reached.contains(node), "missing {node}");
         }
         assert!(!super::reachable_within(&edges, "entity:12", 2).contains("ticker:BB"));
+    }
+
+    #[test]
+    fn dot_labels_escape_backslashes_quotes_and_newlines() {
+        assert_eq!(super::escape_dot(r#"A "B" C\"#), r#"A \"B\" C\\"#);
+        assert_eq!(super::escape_dot("LINE\nTWO"), r"LINE\nTWO");
     }
 
     #[test]

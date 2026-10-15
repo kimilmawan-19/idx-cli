@@ -1626,7 +1626,7 @@ _idx() {
                     return 0
                     ;;
                 --format)
-                    COMPREPLY=($(compgen -f "${cur}"))
+                    COMPREPLY=($(compgen -W "table dot" -- "${cur}"))
                     return 0
                     ;;
                 --output)
