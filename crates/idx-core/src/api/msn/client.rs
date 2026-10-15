@@ -28,6 +28,8 @@ impl MsnClient {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(5)))
             .timeout_recv_body(Some(Duration::from_secs(10)))
+            // Bounds the wait for response headers too, which nothing else does.
+            .timeout_global(Some(Duration::from_secs(60)))
             .build()
             .into();
 
