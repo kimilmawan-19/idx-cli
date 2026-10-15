@@ -152,10 +152,9 @@ fn argv_output_format() -> OutputFormat {
             iter.next().cloned()
         } else if let Some(value) = arg.strip_prefix("--output=") {
             Some(value.to_string())
-        } else if let Some(value) = arg.strip_prefix("-o") {
-            Some(value.trim_start_matches('=').to_string())
         } else {
-            None
+            arg.strip_prefix("-o")
+                .map(|value| value.trim_start_matches('=').to_string())
         };
         if let Some(setting) = value.as_deref().and_then(OutputSetting::parse) {
             flag = Some(setting);
