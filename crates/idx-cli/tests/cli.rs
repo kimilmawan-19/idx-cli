@@ -2330,3 +2330,32 @@ fn msn_screen_rejects_invalid_totals_without_populating_cache() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn closed_stdout_pipe_ends_quietly_instead_of_panicking() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command as StdCommand, Stdio};
+    const SIGPIPE: i32 = 13;
+
+    let root = test_env_dir("closed-stdout-pipe");
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_idx"))
+        .current_dir(core_dir())
+        .env("IDX_USE_MOCK_PROVIDER", "1")
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .args(["completions", "bash"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn idx");
+    // Close the read end before the script is written: every write fails.
+    drop(child.stdout.take());
+    let output = child.wait_with_output().expect("wait for idx");
+
+    assert_ne!(output.status.code(), Some(101), "{output:?}");
+    assert!(output.status.signal() == Some(SIGPIPE), "{output:?}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+        "{output:?}"
+    );
+}
