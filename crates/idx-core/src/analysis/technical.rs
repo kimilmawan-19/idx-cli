@@ -83,7 +83,9 @@ pub fn rsi(closes: &[f64], period: usize) -> Vec<Option<f64>> {
 
 fn rsi_from_averages(avg_gain: f64, avg_loss: f64) -> f64 {
     if avg_loss == 0.0 {
-        return 100.0;
+        // No movement at all (a suspended or untraded stock) is neutral,
+        // not overbought.
+        return if avg_gain == 0.0 { 50.0 } else { 100.0 };
     }
 
     let rs = avg_gain / avg_loss;
@@ -170,6 +172,14 @@ mod tests {
         let data = [1.0, 2.0, 3.0, 4.0, 5.0];
         let values = sma(&data, 3);
         assert_eq!(values, vec![None, None, Some(2.0), Some(3.0), Some(4.0)]);
+    }
+
+    #[test]
+    fn rsi_of_a_flat_series_is_neutral() {
+        let closes = vec![1_000.0; 20];
+        let values = rsi(&closes, 14);
+        assert_eq!(values[14], Some(50.0));
+        assert_eq!(values[19], Some(50.0));
     }
 
     #[test]

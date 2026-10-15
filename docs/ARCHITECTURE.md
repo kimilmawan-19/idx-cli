@@ -166,6 +166,8 @@ CLI flags > environment variables > config file > defaults
 - Exit codes by class: `0` success, `2` `INVALIDINPUT`/`CONFIGERROR` and clap usage
   errors, `3` `SYMBOLNOTFOUND`/`NOMARKETDATA`/`CACHEMISS`, `4` `HTTP`/`RATELIMITED`/
   `PROVIDERUNAVAILABLE`/`OFFLINE`/`AUTHERROR`, `5` `UNSUPPORTED`, `1` everything else
+- clap usage errors (missing argument, unknown flag, bad value) take the same
+  shape in JSON modes: `INVALIDINPUT`, exit `2`. `--help` and `--version` stay on stdout.
 - A totally failed `stocks compare` emits one structured error in JSON mode; per-symbol warnings are retained for partial success, not printed ahead of a total-failure error.
 
 ## CLI Output and Offline Cache
@@ -177,8 +179,13 @@ CLI flags > environment variables > config file > defaults
   and a single object as one line.
 - ANSI styling goes through `output::style` and is disabled when stdout is not a
   terminal or color is turned off.
-- `version`, `cache info`, `cache clear`, and `ownership resolve map|merge` emit
-  JSON objects when JSON output is selected.
+- `version`, `cache info`, `cache clear`, `config init|get|set|path`, and
+  `ownership resolve map|merge` emit JSON objects when JSON output is selected.
+  `config` runs even when the config file is invalid (it repairs it), using the
+  flag/env output format.
+- `ownership graph --format dot` always writes DOT, even when JSON output is
+  selected: an explicit format wins over the `auto` resolution.
+- A closed stdout (`| head`) ends the process quietly: SIGPIPE keeps its default action.
 - `stocks quote` and `stocks compare` require at least one symbol.
 - Offline reads warn on stderr when serving cache entries past their TTL,
   including the cache fetch timestamp. `--quiet` suppresses these warnings.

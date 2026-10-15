@@ -25,6 +25,26 @@ pub fn format_idr(value: i64) -> String {
     format!("{sign}{}", out.chars().rev().collect::<String>())
 }
 
+/// Statement line items are mostly whole rupiah, but per-share and ratio
+/// items (EPS 467.9) lost their fraction to an `as i64` truncation.
+fn format_statement_value(value: f64) -> String {
+    if !value.is_finite() {
+        return "-".to_string();
+    }
+    if value.fract() == 0.0 {
+        return format_idr(value as i64);
+    }
+    let rounded = (value * 100.0).round() / 100.0;
+    let whole = format_idr(rounded.trunc() as i64);
+    let cents = ((rounded.abs().fract()) * 100.0).round() as i64;
+    let sign = if rounded < 0.0 && rounded.trunc() == 0.0 {
+        "-"
+    } else {
+        ""
+    };
+    format!("{sign}{whole}.{cents:02}")
+}
+
 pub fn format_u64(value: u64) -> String {
     format_idr(value as i64)
 }
@@ -520,6 +540,7 @@ fn format_earnings_period(period: &str) -> String {
     }
 
     if trimmed.len() == 6
+        && trimmed.is_ascii()
         && trimmed.starts_with('Q')
         && trimmed[1..2].chars().all(|ch| ch.is_ascii_digit())
         && trimmed[2..].chars().all(|ch| ch.is_ascii_digit())
@@ -684,11 +705,7 @@ pub fn print_profile(profile: &CompanyProfile) -> Result<(), IdxError> {
     }
     if !profile.description.is_empty() {
         // Truncate long descriptions for table display
-        let desc = if profile.description.len() > 200 {
-            format!("{}...", &profile.description[..200])
-        } else {
-            profile.description.clone()
-        };
+        let desc = truncate_chars(&profile.description, 200);
         table.add_row(vec![Cell::new("Description"), Cell::new(desc)]);
     }
     if !profile.officers.is_empty() {
@@ -726,7 +743,10 @@ pub fn print_financials(fin: &FinancialStatements) -> Result<(), IdxError> {
         entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         for (label, value) in entries {
-            t.add_row(vec![Cell::new(label), Cell::new(format_idr(*value as i64))]);
+            t.add_row(vec![
+                Cell::new(label),
+                Cell::new(format_statement_value(*value)),
+            ]);
         }
         println!("{t}");
     };
@@ -876,18 +896,23 @@ fn add_earnings_forecast_row(table: &mut Table, row: &EarningsData) {
 }
 
 fn truncate_url(url: &str) -> String {
-    if url.len() > 72 {
-        format!("{}...", &url[..72])
-    } else {
-        url.to_string()
+    truncate_chars(url, 72)
+}
+
+/// The first `max` characters plus `...` when longer. Slicing by bytes
+/// panics inside a multibyte character (`’`, `é`).
+fn truncate_chars(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}...", &text[..end]),
+        None => text.to_string(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        format_earnings_period, format_idr, format_signal, format_table_date, format_u64,
-        humanize_metric_key, stale_quote_notes,
+        format_earnings_period, format_idr, format_signal, format_statement_value,
+        format_table_date, format_u64, humanize_metric_key, stale_quote_notes, truncate_chars,
     };
     use idx_core::analysis::signals::Signal;
     use idx_core::api::types::Quote;
@@ -963,5 +988,25 @@ mod tests {
         assert_eq!(format_earnings_period("2025"), "FY2025");
         assert_eq!(format_earnings_period("Q12026"), "Q1 2026");
         assert_eq!(format_earnings_period(""), "-");
+    }
+
+    #[test]
+    fn truncation_respects_multibyte_characters() {
+        let text = format!("{}’s bank", "a".repeat(199));
+        assert_eq!(
+            truncate_chars(&text, 200),
+            format!("{}’...", "a".repeat(199))
+        );
+        assert_eq!(truncate_chars("short", 200), "short");
+        assert_eq!(format_earnings_period("Qé123"), "Qé123");
+    }
+
+    #[test]
+    fn statement_values_keep_their_fraction() {
+        assert_eq!(format_statement_value(1_234_567.0), "1,234,567");
+        assert_eq!(format_statement_value(467.9), "467.90");
+        assert_eq!(format_statement_value(-0.25), "-0.25");
+        assert_eq!(format_statement_value(-1_500.125), "-1,500.13");
+        assert_eq!(format_statement_value(f64::NAN), "-");
     }
 }

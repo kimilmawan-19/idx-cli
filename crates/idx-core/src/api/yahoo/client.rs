@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::api::types::{Interval, Period};
@@ -23,6 +23,9 @@ pub(super) struct YahooClient {
     /// One jar per client, paired with its crumb: clients in the same process
     /// (concurrent MCP calls) must not overwrite each other's cookies.
     cookie_jar: PathBuf,
+    /// The jar's private directory, created on first use.
+    cookie_dir: PathBuf,
+    cookie_dir_ready: OnceLock<Result<(), String>>,
 }
 
 impl YahooClient {
@@ -30,20 +33,46 @@ impl YahooClient {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_connect(Some(Duration::from_secs(5)))
             .timeout_recv_body(Some(Duration::from_secs(10)))
+            // Bounds the wait for response headers too, which nothing else does.
+            .timeout_global(Some(Duration::from_secs(30)))
             .build()
             .into();
 
+        // A fresh, unguessable directory created with create_dir (which fails
+        // if anything already exists there) and mode 0700: a predictable file
+        // in the shared temp dir could be pre-planted as a symlink for curl
+        // to overwrite, or read by other users.
         static NEXT_JAR: AtomicU64 = AtomicU64::new(0);
-        let cookie_jar = std::env::temp_dir().join(format!(
-            "idx_yf_{}_{}.txt",
+        let cookie_dir = std::env::temp_dir().join(format!(
+            "idx_yf_{}_{}_{:016x}",
             std::process::id(),
-            NEXT_JAR.fetch_add(1, Ordering::Relaxed)
+            NEXT_JAR.fetch_add(1, Ordering::Relaxed),
+            fastrand::u64(..)
         ));
         Self {
             agent,
             crumb: Mutex::new(None),
-            cookie_jar,
+            cookie_jar: cookie_dir.join("cookies.txt"),
+            cookie_dir,
+            cookie_dir_ready: OnceLock::new(),
         }
+    }
+
+    fn ensure_cookie_dir(&self) -> Result<(), IdxError> {
+        self.cookie_dir_ready
+            .get_or_init(|| {
+                let mut builder = std::fs::DirBuilder::new();
+                #[cfg(unix)]
+                std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+                builder.create(&self.cookie_dir).map_err(|e| {
+                    format!(
+                        "failed to create Yahoo cookie directory {}: {e}",
+                        self.cookie_dir.display()
+                    )
+                })
+            })
+            .clone()
+            .map_err(IdxError::Io)
     }
 
     fn chart_url(symbol: &str, period: &Period, interval: &Interval) -> String {
@@ -56,7 +85,8 @@ impl YahooClient {
 
     fn quote_summary_url(symbol: &str, crumb: &str) -> String {
         format!(
-            "{BASE_URL}/v10/finance/quoteSummary/{symbol}?modules=summaryDetail,defaultKeyStatistics,financialData,assetProfile,incomeStatementHistory&crumb={crumb}"
+            "{BASE_URL}/v10/finance/quoteSummary/{symbol}?modules=summaryDetail,defaultKeyStatistics,financialData,assetProfile,incomeStatementHistory&crumb={}",
+            percent_encode(crumb)
         )
     }
 
@@ -75,6 +105,16 @@ impl YahooClient {
         if normalized.contains("too many requests") {
             return Err(IdxError::Http(
                 "Yahoo crumb request was rate limited".to_string(),
+            ));
+        }
+        // A crumb is a short token; anything else (a JSON error body, an
+        // "Unauthorized" page) would otherwise be sent as one.
+        if crumb.len() > 64
+            || !crumb.chars().all(|c| c.is_ascii_graphic())
+            || crumb.contains(['{', '<'])
+        {
+            return Err(IdxError::Http(
+                "received an error body instead of a Yahoo crumb".to_string(),
             ));
         }
 
@@ -130,6 +170,7 @@ impl YahooClient {
     fn fetch_crumb_via_curl(&self) -> Result<String, IdxError> {
         let binary = curl_impersonate::chrome_curl_binary()?;
 
+        self.ensure_cookie_dir()?;
         let cookie_jar = &self.cookie_jar;
         let cookie_jar_str = cookie_jar.to_str().ok_or_else(|| {
             IdxError::Io(format!(
@@ -141,7 +182,9 @@ impl YahooClient {
         // Step 1: fetch fc.yahoo.com to set A3 cookie (returns 404 but writes cookie jar).
         // We allow non-zero exit here since 404 still writes the cookie.
         let _ = Command::new(binary)
-            .args(["--silent", "--cookie-jar", cookie_jar_str, COOKIE_FETCH_URL])
+            .args(curl_impersonate::SAFETY_ARGS)
+            .args(["--max-time", "30", "--silent", "--cookie-jar"])
+            .args([cookie_jar_str, COOKIE_FETCH_URL])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .output();
@@ -149,7 +192,14 @@ impl YahooClient {
         // Step 2: fetch crumb with cookie jar (Chrome TLS fingerprint + A3 cookie).
         let output = curl_impersonate::run(
             "Yahoo crumb fetch",
-            &["--silent", "--cookie", cookie_jar_str, CRUMB_FETCH_URL],
+            &[
+                "--silent",
+                "--max-time",
+                "30",
+                "--cookie",
+                cookie_jar_str,
+                CRUMB_FETCH_URL,
+            ],
         )?;
 
         let body = String::from_utf8_lossy(&output.stdout);
@@ -291,9 +341,24 @@ fn jitter() -> Duration {
     Duration::from_millis(fastrand::u64(0..100))
 }
 
+/// Query-string encoding: crumbs can hold `/`, `+` or `=`.
+fn percent_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 impl Drop for YahooClient {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.cookie_jar);
+        if matches!(self.cookie_dir_ready.get(), Some(Ok(()))) {
+            let _ = std::fs::remove_dir_all(&self.cookie_dir);
+        }
     }
 }
 
@@ -317,6 +382,16 @@ mod tests {
         let rate_limited = YahooClient::parse_crumb_body("Too Many Requests")
             .expect_err("rate limited crumb must fail");
         assert!(matches!(rate_limited, crate::error::IdxError::Http(_)));
+
+        for body in [r#"{"finance":{"error":"Unauthorized"}}"#, "Invalid Cookie"] {
+            assert!(YahooClient::parse_crumb_body(body).is_err(), "{body}");
+        }
+    }
+
+    #[test]
+    fn crumb_is_percent_encoded_in_the_url() {
+        let url = YahooClient::quote_summary_url("BBCA.JK", "a/b+c=");
+        assert!(url.ends_with("&crumb=a%2Fb%2Bc%3D"), "{url}");
     }
 
     #[test]

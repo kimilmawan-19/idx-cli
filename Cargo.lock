@@ -909,6 +909,7 @@ dependencies = [
  "clap_complete",
  "comfy-table",
  "idx-core",
+ "libc",
  "owo-colors",
  "predicates",
  "rusqlite",

@@ -106,6 +106,11 @@ impl Market<'_> {
             region,
             limit,
         } = *query;
+        if limit == 0 {
+            return Err(IdxError::InvalidInput(
+                "screener limit must be at least 1".to_string(),
+            ));
+        }
         // Filters re-sorted client-side need the whole MSN list: MSN orders
         // by 1-year return, so truncating first and then sorting by day
         // change made `--limit 3` return different stocks than `--limit 25`.
@@ -194,7 +199,12 @@ impl ScreenFilter {
     fn needs_full_list(self) -> bool {
         matches!(
             self,
-            Self::HighVolume | Self::LargeCap | Self::TopPerformers | Self::WorstPerformers
+            Self::HighVolume
+                | Self::LargeCap
+                | Self::TopPerformers
+                | Self::WorstPerformers
+                | Self::Week52High
+                | Self::Week52Low
         )
     }
 }

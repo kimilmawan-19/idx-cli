@@ -36,7 +36,19 @@ fn expand_symbols(args: &[String]) -> Result<Vec<String>, IdxError> {
             }
             symbols.extend(from_stdin);
         } else {
-            symbols.extend(arg.split(',').map(String::from));
+            // `BBCA,BBRI,` (a trailing or doubled comma) is two symbols, as
+            // it already was on stdin; an empty argument still fails below.
+            let parts: Vec<String> = arg
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect();
+            if parts.is_empty() {
+                symbols.push(arg.clone());
+            } else {
+                symbols.extend(parts);
+            }
         }
     }
     Ok(symbols)

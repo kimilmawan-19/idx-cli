@@ -25,6 +25,12 @@ stdout is not a terminal, and with `--no-color`.
   {"error":true,"code":"INVALIDINPUT","message":"invalid input: invalid ticker symbol '../x'"}
   ```
 
+- Usage mistakes (a missing argument, an unknown flag, a bad value) are errors
+  like any other: in JSON modes they are an `INVALIDINPUT` object with exit
+  `2`, not clap's usage text. `--help` and `--version` always print to stdout.
+- Every command follows the format, `idx config` included: plain text on a
+  terminal or with `-o table`, one JSON object otherwise.
+
 ## Exit codes
 
 | Exit | Meaning | What to do |
@@ -50,4 +56,6 @@ idx stocks screen --filter high-dividend | jq -r '.[].symbol' | idx stocks compa
 ```
 
 `stocks quote` and `stocks compare` read symbols from stdin when given `-`,
-separated by whitespace or commas.
+separated by whitespace or commas. A trailing comma (`BBCA,`) is ignored.
+
+Closing the pipe early (`idx ... | head -1`) ends idx quietly.

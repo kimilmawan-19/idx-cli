@@ -5,6 +5,39 @@ use rusqlite::{Connection, params};
 use crate::error::IdxError;
 use crate::ownership::types::{GraphEdge, GraphNode, GraphNodeType, OwnershipSource};
 
+/// Deepest traversal accepted. Custodian and aggregate holders connect most
+/// of the market within a few hops, so deeper graphs are the whole market.
+pub const MAX_GRAPH_DEPTH: usize = 4;
+
+/// Nodes within `depth` hops of `root`, edges taken as undirected. A
+/// breadth-first walk visits each node once, where enumerating paths grows
+/// exponentially with depth.
+fn reachable_within(edges: &[GraphEdge], root: &str, depth: usize) -> BTreeSet<String> {
+    let mut neighbors: HashMap<&str, Vec<&str>> = HashMap::new();
+    for edge in edges {
+        neighbors.entry(&edge.from).or_default().push(&edge.to);
+        neighbors.entry(&edge.to).or_default().push(&edge.from);
+    }
+
+    let mut visited: BTreeSet<String> = BTreeSet::from([root.to_string()]);
+    let mut frontier = vec![root];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for node in frontier {
+            for &neighbor in neighbors.get(node).into_iter().flatten() {
+                if visited.insert(neighbor.to_string()) {
+                    next.push(neighbor);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    visited
+}
+
 /// Query ownership graph starting from a ticker or entity, traversing N hops.
 /// Root can be ticker code (`BBCA`) or entity name — auto-detect.
 pub fn query_ownership_graph(
@@ -14,82 +47,20 @@ pub fn query_ownership_graph(
 ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>), IdxError> {
     let root = root.trim();
     if root.is_empty() {
-        return Err(IdxError::ParseError(
+        return Err(IdxError::InvalidInput(
             "graph root cannot be empty".to_string(),
         ));
+    }
+    if !(1..=MAX_GRAPH_DEPTH).contains(&depth) {
+        return Err(IdxError::InvalidInput(format!(
+            "graph depth must be between 1 and {MAX_GRAPH_DEPTH}"
+        )));
     }
 
     let root_node_id = detect_root_node(conn, root)?;
 
-    let mut visited: BTreeSet<String> = BTreeSet::new();
-    {
-        let mut stmt = conn
-            .prepare(
-                "WITH RECURSIVE
-                    latest_ksei AS (
-                        SELECT sha256
-                        FROM ownership_releases
-                        ORDER BY as_of_date DESC, imported_at DESC
-                        LIMIT 1
-                    ),
-                    latest_bing AS (
-                        SELECT ticker_id, MAX(report_date) AS report_date
-                        FROM bing_holdings
-                        GROUP BY ticker_id
-                    ),
-                    all_edges AS (
-                        SELECT
-                            'entity:' || k.entity_id AS from_id,
-                            'ticker:' || t.code AS to_id
-                        FROM ksei_holdings k
-                        JOIN tickers t ON t.id = k.ticker_id
-                        JOIN latest_ksei lk ON lk.sha256 = k.release_sha256
-                        WHERE k.entity_id IS NOT NULL
-
-                        UNION
-
-                        SELECT
-                            'entity:' || b.entity_id AS from_id,
-                            'ticker:' || t.code AS to_id
-                        FROM bing_holdings b
-                        JOIN latest_bing lb
-                          ON lb.ticker_id = b.ticker_id
-                         AND lb.report_date = b.report_date
-                        JOIN tickers t ON t.id = b.ticker_id
-                        WHERE b.entity_id IS NOT NULL
-                          AND b.signal = 'holder'
-                    ),
-                    neighbors AS (
-                        SELECT from_id AS a, to_id AS b FROM all_edges
-                        UNION
-                        SELECT to_id AS a, from_id AS b FROM all_edges
-                    ),
-                    walk(node_id, depth, path) AS (
-                        SELECT ?1 AS node_id, 0 AS depth, ?1 AS path
-                        UNION ALL
-                        SELECT n.b, w.depth + 1, w.path || '>' || n.b
-                        FROM walk w
-                        JOIN neighbors n ON n.a = w.node_id
-                        WHERE w.depth < ?2
-                          AND instr(w.path, n.b) = 0
-                    )
-                    SELECT DISTINCT node_id
-                    FROM walk",
-            )
-            .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
-
-        let rows = stmt
-            .query_map(params![root_node_id, depth as i64], |row| {
-                row.get::<_, String>(0)
-            })
-            .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
-
-        for row in rows {
-            visited.insert(row.map_err(|e| IdxError::DatabaseError(e.to_string()))?);
-        }
-    }
-
     let mut edges = query_all_edges(conn)?;
+    let visited = reachable_within(&edges, &root_node_id, depth);
     edges.retain(|edge| visited.contains(&edge.from) && visited.contains(&edge.to));
 
     let nodes = build_nodes(conn, &visited)?;
@@ -360,8 +331,19 @@ fn source_label(source: OwnershipSource) -> &'static str {
     }
 }
 
+/// A DOT quoted-string body: a trailing backslash or a raw newline in a
+/// holder name otherwise broke the generated file.
 fn escape_dot(value: &str) -> String {
-    value.replace('"', "\\\"")
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' | '\r' => out.push_str("\\n"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -458,5 +440,50 @@ mod tests {
         assert!(!nodes.iter().any(|node| node.label == "OLDER HOLDER"));
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].percentage_bps, 1200);
+    }
+
+    fn edge(from: &str, to: &str) -> super::GraphEdge {
+        super::GraphEdge {
+            from: from.to_string(),
+            to: to.to_string(),
+            percentage_bps: 100,
+            source: crate::ownership::types::OwnershipSource::Ksei,
+        }
+    }
+
+    #[test]
+    fn reachability_does_not_confuse_ids_sharing_a_prefix() {
+        // entity:12 -> ticker:BBCA -> entity:1 -> ticker:BB: a substring
+        // check on the path pruned entity:1 (inside "entity:12") and
+        // ticker:BB (inside "ticker:BBCA").
+        let edges = vec![
+            edge("entity:12", "ticker:BBCA"),
+            edge("entity:1", "ticker:BBCA"),
+            edge("entity:1", "ticker:BB"),
+        ];
+        let reached = super::reachable_within(&edges, "entity:12", 3);
+        for node in ["entity:12", "ticker:BBCA", "entity:1", "ticker:BB"] {
+            assert!(reached.contains(node), "missing {node}");
+        }
+        assert!(!super::reachable_within(&edges, "entity:12", 2).contains("ticker:BB"));
+    }
+
+    #[test]
+    fn dot_labels_escape_backslashes_quotes_and_newlines() {
+        assert_eq!(super::escape_dot(r#"A "B" C\"#), r#"A \"B\" C\\"#);
+        assert_eq!(super::escape_dot("LINE\nTWO"), r"LINE\nTWO");
+    }
+
+    #[test]
+    fn depth_outside_the_supported_range_is_invalid_input() {
+        let conn = setup();
+        upsert_ticker(&conn, "AA", None).unwrap();
+        for depth in [0, super::MAX_GRAPH_DEPTH + 1] {
+            let err = query_ownership_graph(&conn, "AA", depth).unwrap_err();
+            assert!(
+                matches!(err, crate::error::IdxError::InvalidInput(_)),
+                "{err:?}"
+            );
+        }
     }
 }

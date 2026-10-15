@@ -53,6 +53,11 @@ idx stocks screen --filter high-dividend --limit 20
 Filters: `top-performers` (default), `worst-performers`, `high-dividend`,
 `low-pe`, `52w-high`, `52w-low`, `high-volume`, `large-cap`.
 
+`--region` picks the market: `id` (default), `us`, `sg`, `hk` or `jp`. Only
+`id` symbols carry the `.JK` suffix; the others print as MSN names them. MSN
+may have no list for a filter and region, in which case the result is empty
+(`low-pe` for `id` is empty at the time of writing).
+
 Screen results pipe straight into `compare`:
 
 ```bash

@@ -357,6 +357,16 @@ args = ["ownership", "changes", "--from", "2026-01-30", "--to", "2026-02-27"]
 ownership = true
 
 [[case]]
+name = "ownership-changes-bad-date"
+args = ["ownership", "changes", "--from", "30-01-2026", "--to", "2026-02-27"]
+ownership = true
+
+[[case]]
+name = "ownership-changes-unknown-date"
+args = ["ownership", "changes", "--from", "2026-01-15", "--to", "2026-02-27"]
+ownership = true
+
+[[case]]
 name = "ownership-graph"
 args = ["ownership", "graph", "BBCA"]
 ownership = true

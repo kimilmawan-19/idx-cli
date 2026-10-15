@@ -408,10 +408,24 @@ fn optional(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
+/// Numeric cells arrive as plain numbers; text cells may group thousands
+/// with commas (`3,200,142,830`). A comma that is not a thousands group
+/// (`1,5`, an Indonesian decimal) is rejected rather than read as 15.
 fn parse_number(raw: &str, line: usize, name: &str) -> Result<f64, IdxError> {
-    raw.replace(',', "")
-        .parse::<f64>()
-        .ok()
+    let digits_only = |text: &str| !text.is_empty() && text.chars().all(|c| c.is_ascii_digit());
+    let integer_part = raw
+        .trim_start_matches('-')
+        .split('.')
+        .next()
+        .unwrap_or_default();
+    let well_grouped = !raw.contains(',') || {
+        let mut groups = integer_part.split(',');
+        let first = groups.next().unwrap_or_default();
+        digits_only(first) && first.len() <= 3 && groups.all(|g| g.len() == 3 && digits_only(g))
+    };
+    well_grouped
+        .then(|| raw.replace(',', ""))
+        .and_then(|plain| plain.parse::<f64>().ok())
         .filter(|value| value.is_finite())
         .ok_or_else(|| {
             IdxError::ParseError(format!("ownership XLSX row {line}: invalid {name} '{raw}'"))
@@ -622,5 +636,17 @@ mod tests {
     #[test]
     fn rejects_non_xlsx_bytes() {
         assert!(parse_above1_xlsx_bytes(b"%PDF-1.7 not a workbook").is_err());
+    }
+
+    #[test]
+    fn text_numbers_accept_thousands_groups_only() {
+        assert_eq!(
+            super::parse_number("3,200,142,830", 2, "n").unwrap(),
+            3_200_142_830.0
+        );
+        assert_eq!(super::parse_number("54.94", 2, "n").unwrap(), 54.94);
+        assert_eq!(super::parse_number("1,234.5", 2, "n").unwrap(), 1_234.5);
+        assert!(super::parse_number("1,5", 2, "n").is_err());
+        assert!(super::parse_number("12,00", 2, "n").is_err());
     }
 }

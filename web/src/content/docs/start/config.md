@@ -22,11 +22,23 @@ idx config get cache.quote_ttl
 idx config path
 ```
 
+These print plain text on a terminal. Piped, or with `-o json`, they print one
+JSON object instead (`{"key":"cache.quote_ttl","value":"300"}`, `{"path":"…"}`,
+`{"key":…,"ok":true,"value":…}`), so a script that wants the bare path needs
+`-o table`:
+
+```bash
+config=$(idx -o table config path)
+```
+
+`idx config` keeps working when the file or an `IDX_*` variable is invalid, so
+`idx config set` can repair it.
+
 ```toml
 [general]
 provider = "msn"           # msn | yahoo
 history_provider = "auto"  # auto | yahoo | msn
-exchange = "JK"
+exchange = "JK"            # 1-4 letters or digits, appended to every ticker
 output = "auto"            # auto | table | json | jsonl
 color = true
 
@@ -47,7 +59,7 @@ fundamental_ttl = 3600
 | `IDX_HISTORY_PROVIDER` | `general.history_provider` |
 | `IDX_EXCHANGE` | `general.exchange` |
 | `IDX_OUTPUT` | `general.output` |
-| `IDX_NO_COLOR` | `general.color` (`1` or `true` disables colour) |
+| `IDX_NO_COLOR` | `general.color` (`1` or `true` disables colour); a non-empty `NO_COLOR` does too |
 | `IDX_CACHE_QUOTE_TTL` | `cache.quote_ttl` |
 | `IDX_CACHE_FUNDAMENTAL_TTL` | `cache.fundamental_ttl` |
 | `IDX_OWNERSHIP_SNAPSHOT_MANIFEST` | `ownership.snapshot_manifest` |

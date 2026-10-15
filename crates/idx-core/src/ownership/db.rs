@@ -7,7 +7,6 @@ use rusqlite::{Connection, params};
 
 use crate::config::get_config_value;
 use crate::error::IdxError;
-use crate::ownership::search;
 use crate::ownership::types::{
     BingHolding, ChangeRow, ChangeType, ConcentrationMetrics, CrossHolderRow, Entity,
     EntityHoldings, EntityTickerRow, FlowSignal, HolderRow, InstitutionalFlow, KseiHolding,
@@ -34,14 +33,6 @@ CREATE TABLE IF NOT EXISTS entities (
     country         TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts USING fts5(
-    canonical_name,
-    aliases,
-    content='entities',
-    content_rowid='id',
-    tokenize='trigram'
 );
 
 CREATE TABLE IF NOT EXISTS entity_aliases (
@@ -339,17 +330,37 @@ pub fn insert_release(conn: &Connection, release: &OwnershipRelease) -> Result<i
     Ok(conn.last_insert_rowid())
 }
 
+/// Run `f` atomically. A SAVEPOINT nests, so callers can group several of
+/// these (an import wraps entity resolution and the release write in one).
+pub(crate) fn in_transaction<T>(
+    conn: &Connection,
+    f: impl FnOnce() -> Result<T, IdxError>,
+) -> Result<T, IdxError> {
+    conn.execute_batch("SAVEPOINT idx_tx")
+        .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
+    match f() {
+        Ok(value) => {
+            conn.execute_batch("RELEASE idx_tx")
+                .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK TO idx_tx; RELEASE idx_tx");
+            Err(err)
+        }
+    }
+}
+
 /// Insert or replace a complete KSEI release and its rows atomically.
+/// The release records the rows actually stored: duplicate rows (same
+/// ticker and raw investor name) are kept once.
 pub fn write_ksei_release(
     conn: &Connection,
     release: &OwnershipRelease,
     holdings: &[KseiHolding],
     replace_existing: bool,
 ) -> Result<usize, IdxError> {
-    conn.execute("BEGIN IMMEDIATE", [])
-        .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
-
-    let result = (|| {
+    in_transaction(conn, || {
         if replace_existing {
             conn.execute(
                 "DELETE FROM ksei_holdings WHERE release_sha256 = ?1",
@@ -364,21 +375,13 @@ pub fn write_ksei_release(
         }
 
         let inserted = insert_ksei_holdings_rows(conn, holdings)?;
-        let _ = insert_release(conn, release)?;
+        let stored = OwnershipRelease {
+            row_count: inserted,
+            ..release.clone()
+        };
+        let _ = insert_release(conn, &stored)?;
         Ok(inserted)
-    })();
-
-    match result {
-        Ok(inserted) => {
-            conn.execute("COMMIT", [])
-                .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
-            Ok(inserted)
-        }
-        Err(err) => {
-            let _ = conn.execute("ROLLBACK", []);
-            Err(err)
-        }
-    }
+    })
 }
 
 /// Check if a release with this SHA-256 already exists.
@@ -926,33 +929,56 @@ pub fn query_changes(
     let mut stmt = conn
         .prepare(
             "WITH
+                -- One release per date (the latest import, as for every other
+                -- query), and one row per holder: several raw names can
+                -- resolve to one entity, which multiplied the join below.
+                from_release AS (
+                    SELECT k.release_sha256 AS sha256
+                    FROM ksei_holdings k
+                    JOIN ownership_releases r ON r.sha256 = k.release_sha256
+                    WHERE k.report_date = ?1
+                    ORDER BY r.imported_at DESC
+                    LIMIT 1
+                ),
                 from_snapshot AS (
                     SELECT
                         t.code AS ticker_code,
-                        COALESCE(e.canonical_name, k.raw_investor_name) AS entity_name,
+                        MIN(COALESCE(e.canonical_name, k.raw_investor_name)) AS entity_name,
                         CASE
                             WHEN k.entity_id IS NOT NULL THEN 'id:' || k.entity_id
                             ELSE 'raw:' || UPPER(TRIM(k.raw_investor_name))
                         END AS holder_key,
-                        k.percentage_bps AS old_bps
+                        SUM(k.percentage_bps) AS old_bps
                     FROM ksei_holdings k
+                    JOIN from_release rel ON rel.sha256 = k.release_sha256
                     JOIN tickers t ON t.id = k.ticker_id
                     LEFT JOIN entities e ON e.id = k.entity_id
                     WHERE k.report_date = ?1
+                    GROUP BY t.code, holder_key
+                ),
+                to_release AS (
+                    SELECT k.release_sha256 AS sha256
+                    FROM ksei_holdings k
+                    JOIN ownership_releases r ON r.sha256 = k.release_sha256
+                    WHERE k.report_date = ?2
+                    ORDER BY r.imported_at DESC
+                    LIMIT 1
                 ),
                 to_snapshot AS (
                     SELECT
                         t.code AS ticker_code,
-                        COALESCE(e.canonical_name, k.raw_investor_name) AS entity_name,
+                        MIN(COALESCE(e.canonical_name, k.raw_investor_name)) AS entity_name,
                         CASE
                             WHEN k.entity_id IS NOT NULL THEN 'id:' || k.entity_id
                             ELSE 'raw:' || UPPER(TRIM(k.raw_investor_name))
                         END AS holder_key,
-                        k.percentage_bps AS new_bps
+                        SUM(k.percentage_bps) AS new_bps
                     FROM ksei_holdings k
+                    JOIN to_release rel ON rel.sha256 = k.release_sha256
                     JOIN tickers t ON t.id = k.ticker_id
                     LEFT JOIN entities e ON e.id = k.entity_id
                     WHERE k.report_date = ?2
+                    GROUP BY t.code, holder_key
                 ),
                 keys AS (
                     SELECT ticker_code, holder_key FROM from_snapshot
@@ -1123,7 +1149,6 @@ pub fn manual_map(conn: &Connection, raw_name: &str, canonical_name: &str) -> Re
         )
         .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
-        let _ = search::rebuild_fts(conn);
         Ok(())
     })();
 
@@ -1194,7 +1219,6 @@ pub fn merge_entities(conn: &Connection, keep_id: i64, merge_id: i64) -> Result<
         conn.execute("DELETE FROM entities WHERE id = ?1", params![merge_id])
             .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
-        let _ = search::rebuild_fts(conn);
         Ok(())
     })();
 
@@ -1385,8 +1409,9 @@ mod tests {
 
     use crate::ownership::db::{
         compute_concentration, ensure_schema, get_ticker_id, insert_bing_holdings,
-        insert_ksei_holdings, insert_release, query_concentration, query_cross_holders,
-        query_ticker_holdings, release_exists, upsert_ticker, write_ksei_release,
+        insert_ksei_holdings, insert_release, query_changes, query_concentration,
+        query_cross_holders, query_ticker_holdings, release_exists, upsert_ticker,
+        write_ksei_release,
     };
     use crate::ownership::types::{
         BingHolding, FlowSignal, KseiHolding, Locality, OwnershipRelease,
@@ -1493,6 +1518,90 @@ mod tests {
         assert_eq!(data.holders[0].percentage_bps, 4000);
         assert_eq!(data.concentration.top1_bps, 4000);
         assert_eq!(data.concentration.top3_bps, 6400);
+    }
+
+    fn release_with(
+        conn: &Connection,
+        sha: &str,
+        date: NaiveDate,
+        imported_at: i64,
+        rows: &[(i64, Option<i64>, &str, i64)],
+    ) {
+        let release = OwnershipRelease {
+            id: 0,
+            source_url: None,
+            sha256: sha.to_string(),
+            as_of_date: date,
+            row_count: rows.len(),
+            imported_at,
+        };
+        let holdings: Vec<KseiHolding> = rows
+            .iter()
+            .map(|&(ticker_id, entity_id, name, bps)| KseiHolding {
+                id: 0,
+                ticker_id,
+                entity_id,
+                raw_investor_name: name.to_string(),
+                investor_type: None,
+                locality: None,
+                nationality: None,
+                domicile: None,
+                holdings_scripless: bps,
+                holdings_scrip: 0,
+                total_shares: bps,
+                percentage_bps: bps,
+                report_date: date,
+                release_sha256: sha.to_string(),
+            })
+            .collect();
+        write_ksei_release(conn, &release, &holdings, false).unwrap();
+    }
+
+    #[test]
+    fn test_changes_use_one_release_per_date_and_one_row_per_holder() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        conn.execute(
+            "INSERT INTO entities (canonical_name, created_at, updated_at) VALUES ('HOLDER', 0, 0)",
+            [],
+        )
+        .unwrap();
+        let holder = conn.last_insert_rowid();
+        let jan = NaiveDate::from_ymd_opt(2026, 1, 30).unwrap();
+        let feb = NaiveDate::from_ymd_opt(2026, 2, 27).unwrap();
+
+        // Two raw names for one entity in January (600 bps together).
+        release_with(
+            &conn,
+            "jan",
+            jan,
+            1,
+            &[
+                (aa, Some(holder), "HOLDER", 400),
+                (aa, Some(holder), "PT HOLDER", 200),
+            ],
+        );
+        // February imported twice for the same date: the later import wins.
+        release_with(
+            &conn,
+            "feb-old",
+            feb,
+            2,
+            &[(aa, Some(holder), "HOLDER", 900)],
+        );
+        release_with(
+            &conn,
+            "feb-new",
+            feb,
+            3,
+            &[(aa, Some(holder), "HOLDER", 700)],
+        );
+
+        let changes = query_changes(&conn, "2026-01-30", "2026-02-27").unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].old_bps, Some(600));
+        assert_eq!(changes[0].new_bps, Some(700));
+        assert_eq!(changes[0].delta_bps, 100);
     }
 
     #[test]

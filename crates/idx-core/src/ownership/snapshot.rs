@@ -135,12 +135,22 @@ pub fn fetch_manifest(source: &str) -> Result<OwnershipSnapshotManifest, IdxErro
 }
 
 pub fn parse_manifest(raw: &str) -> Result<OwnershipSnapshotManifest, IdxError> {
-    let manifest: OwnershipSnapshotManifest = serde_json::from_str(raw).map_err(|e| {
+    let mut manifest: OwnershipSnapshotManifest = serde_json::from_str(raw).map_err(|e| {
         IdxError::ParseError(format!(
             "failed to parse ownership snapshot manifest JSON: {e}"
         ))
     })?;
     validate_manifest(&manifest)?;
+    // Hashes are compared as computed (lowercase hex); validation accepts
+    // surrounding space and uppercase, which made an otherwise valid
+    // manifest a permanent checksum mismatch.
+    let snapshot = &mut manifest.snapshot;
+    for sha256 in std::iter::once(&mut snapshot.sqlite_sha256)
+        .chain(std::iter::once(&mut snapshot.latest_release_sha256))
+        .chain(snapshot.replaces_sqlite_sha256.iter_mut())
+    {
+        *sha256 = sha256.trim().to_ascii_lowercase();
+    }
     Ok(manifest)
 }
 
@@ -163,7 +173,13 @@ pub fn sync_snapshot<L>(
     let manifest = fetch_manifest(manifest_source)?;
     let local_state = {
         let _shared = lock(db_path, false)?;
-        inspect_local_db(db_path)?
+        match inspect_local_db(db_path) {
+            Ok(state) => state,
+            // --force is how a corrupt or non-SQLite file gets replaced, so
+            // it must not first require reading that file.
+            Err(_) if force => None,
+            Err(err) => return Err(err),
+        }
     };
     let decision = build_sync_decision(local_state.as_ref(), &manifest.snapshot, force);
 

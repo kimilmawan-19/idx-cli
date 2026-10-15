@@ -120,7 +120,7 @@ mod tests {
                         "priceToEarningsRatio": 12.5,
                         "debtToEquityRatio": "-Infinity",
                         "roe": 19.8,
-                        "profitMargin": 44.2,
+                        "profitMargin": 0.442,
                         "currentRatio": 1.4
                     }
                 ]
@@ -144,9 +144,9 @@ mod tests {
                         "year": "2025",
                         "fiscalPeriodType": "TTM",
                         "revenueGrowthRate": "NaN",
-                        "earningsGrowthRate": 12.1,
+                        "earningsGrowthRate": 0.121,
                         "roe": 19.8,
-                        "profitMargin": 44.2,
+                        "profitMargin": 0.442,
                         "debtToEquityRatio": 0.75,
                         "currentRatio": 1.4
                     }

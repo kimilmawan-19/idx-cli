@@ -4,12 +4,12 @@
       {
         "year": "2025",
         "fiscalPeriodType": "TTM",
-        "revenueGrowthRate": 8.1,
-        "earningsGrowthRate": 12.1,
+        "revenueGrowthRate": 0.081,
+        "earningsGrowthRate": 0.121,
         "priceToEarningsRatio": "-Infinity",
         "priceToBookRatio": 4.6,
         "roe": 19.8,
-        "profitMargin": 44.2,
+        "profitMargin": 0.442,
         "debtToEquityRatio": "-Infinity",
         "currentRatio": 1.4,
         "roaTTM": 3.79

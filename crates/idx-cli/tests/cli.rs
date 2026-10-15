@@ -2330,3 +2330,97 @@ fn msn_screen_rejects_invalid_totals_without_populating_cache() {
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn closed_stdout_pipe_ends_quietly_instead_of_panicking() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command as StdCommand, Stdio};
+    const SIGPIPE: i32 = 13;
+
+    let root = test_env_dir("closed-stdout-pipe");
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_idx"))
+        .current_dir(core_dir())
+        .env("IDX_USE_MOCK_PROVIDER", "1")
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .args(["completions", "bash"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn idx");
+    // Close the read end before the script is written: every write fails.
+    drop(child.stdout.take());
+    let output = child.wait_with_output().expect("wait for idx");
+
+    assert_ne!(output.status.code(), Some(101), "{output:?}");
+    assert!(output.status.signal() == Some(SIGPIPE), "{output:?}");
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("panicked"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn ownership_sync_force_replaces_an_unreadable_database() {
+    let publisher_root = test_env_dir("ownership-sync-force-publisher");
+    let (source_db, manifest_path) = prepare_snapshot_fixture(&publisher_root);
+    // Uppercase hex in the manifest is the same checksum.
+    let bytes = fs::read(&source_db).unwrap();
+    write_snapshot_manifest(
+        &manifest_path,
+        &source_db,
+        Some(&sha256_hex(&bytes).to_ascii_uppercase()),
+    );
+
+    let sync_root = test_env_dir("ownership-sync-force-consumer");
+    let target_db = sync_root.join("ownership.db");
+    fs::write(&target_db, b"not a database, just a truncated download").unwrap();
+    for (key, value) in [
+        ("ownership.db_path", target_db.to_str().unwrap()),
+        (
+            "ownership.snapshot_manifest",
+            manifest_path.to_str().unwrap(),
+        ),
+    ] {
+        run_success_stdout(bin_with_root(&sync_root).args(["config", "set", key, value]));
+    }
+
+    // Without --force the unreadable file is reported, not replaced.
+    bin_with_root(&sync_root)
+        .args(["-o", "json", "ownership", "sync"])
+        .assert()
+        .failure();
+    let report = run_success_json(bin_with_root(&sync_root).args([
+        "-o",
+        "json",
+        "ownership",
+        "sync",
+        "--force",
+    ]));
+    assert_eq!(report["reason"], "force refresh requested", "{report}");
+    assert_eq!(fs::read(&target_db).unwrap(), bytes);
+    run_success_json(bin_with_root(&sync_root).args(["-o", "json", "ownership", "releases"]));
+}
+
+#[test]
+fn trailing_comma_in_symbol_list_is_ignored() {
+    let report = run_success_json(
+        test_bin("quote-trailing-comma")
+            .env("IDX_USE_MOCK_PROVIDER", "1")
+            .args(["-o", "json", "stocks", "quote", "BBCA,"]),
+    );
+    assert_eq!(report.as_array().map(Vec::len), Some(1), "{report}");
+    assert_eq!(report[0]["symbol"], "BBCA.JK");
+}
+
+#[test]
+fn invalid_exchange_is_rejected_before_any_request() {
+    test_bin("invalid-exchange")
+        .env("IDX_USE_MOCK_PROVIDER", "1")
+        .env("IDX_EXCHANGE", "JK?x=1")
+        .args(["-o", "json", "stocks", "quote", "BBCA"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("invalid exchange"));
+}

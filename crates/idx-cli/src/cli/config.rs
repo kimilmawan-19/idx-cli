@@ -1,6 +1,9 @@
 use clap::{Args, Subcommand};
 
+use serde_json::json;
+
 use crate::config::{config_path, ensure_default_config, get_config_value, set_config_value};
+use crate::output::{OutputFormat, json::print_json};
 use idx_core::error::IdxError;
 
 #[derive(Debug, Args)]
@@ -22,23 +25,43 @@ pub enum ConfigSubcommand {
     Path,
 }
 
-pub fn handle(cmd: &ConfigCmd) -> Result<(), IdxError> {
+/// Plain text for a terminal or `-o table`; one JSON document in JSON
+/// modes, like every other command.
+pub fn handle(cmd: &ConfigCmd, format: &OutputFormat) -> Result<(), IdxError> {
+    let as_json = format.is_json();
     match &cmd.command {
         ConfigSubcommand::Init => {
             let path = ensure_default_config()?;
-            println!("{}", path.display());
+            if as_json {
+                print_json(&json!({ "path": path.display().to_string() }))?;
+            } else {
+                println!("{}", path.display());
+            }
         }
         ConfigSubcommand::Get { key } => {
             let value = get_config_value(key)?
                 .ok_or_else(|| IdxError::ConfigError(format!("key not found: {key}")))?;
-            println!("{value}");
+            if as_json {
+                print_json(&json!({ "key": key, "value": value }))?;
+            } else {
+                println!("{value}");
+            }
         }
         ConfigSubcommand::Set { key, value } => {
             set_config_value(key, value)?;
-            println!("ok");
+            if as_json {
+                print_json(&json!({ "ok": true, "key": key, "value": value }))?;
+            } else {
+                println!("ok");
+            }
         }
         ConfigSubcommand::Path => {
-            println!("{}", config_path()?.display());
+            let path = config_path()?;
+            if as_json {
+                print_json(&json!({ "path": path.display().to_string() }))?;
+            } else {
+                println!("{}", path.display());
+            }
         }
     }
     Ok(())

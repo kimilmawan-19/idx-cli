@@ -97,8 +97,24 @@ pub fn run_owned_with_fallback(
     Err(last_error.expect("at least one profile was tried"))
 }
 
+/// Applied to every curl run so a stalled server fails the command instead
+/// of hanging it (and, in idx-mcp, a request slot) forever. The total allows
+/// for the largest ownership reports; the size cap matches their parse limit.
+pub const SAFETY_ARGS: &[&str] = &[
+    "--connect-timeout",
+    "15",
+    "--max-time",
+    "600",
+    "--max-filesize",
+    "268435456",
+];
+
 fn run_binary(stage: &str, binary: &str, args: &[String]) -> Result<Output, IdxError> {
-    let output = Command::new(binary).args(args).output().map_err(|e| {
+    let output = Command::new(binary)
+        .args(SAFETY_ARGS)
+        .args(args)
+        .output()
+        .map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             return IdxError::Http(format!(
                 "curl-impersonate binary '{binary}' not found; set {OVERRIDE_ENV} or install nixpkgs#curl-impersonate-chrome"

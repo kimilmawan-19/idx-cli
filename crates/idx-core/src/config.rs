@@ -145,7 +145,7 @@ impl CoreConfig {
                     cfg.history_provider = history_provider;
                 }
                 if let Some(exchange) = general.exchange {
-                    cfg.exchange = exchange;
+                    cfg.exchange = validate_exchange(&exchange)?;
                 }
             }
             if let Some(cache) = parsed.cache {
@@ -165,7 +165,7 @@ impl CoreConfig {
             cfg.history_provider = HistoryProviderKind::parse(&history_provider)?;
         }
         if let Ok(exchange) = std::env::var("IDX_EXCHANGE") {
-            cfg.exchange = exchange;
+            cfg.exchange = validate_exchange(&exchange)?;
         }
         if let Some(parsed) = parse_env_ttl("IDX_CACHE_QUOTE_TTL")? {
             cfg.quote_ttl = parsed;
@@ -207,6 +207,19 @@ fn parse_env_ttl(name: &str) -> Result<Option<u64>, IdxError> {
 
 pub fn default_config_toml() -> String {
     "[general]\nprovider = \"msn\"\nhistory_provider = \"auto\"\nexchange = \"JK\"\noutput = \"auto\"\ncolor = true\n\n[cache]\nquote_ttl = 300\nfundamental_ttl = 3600\n".to_string()
+}
+
+/// An exchange suffix (`JK`, `US`): it is appended to every ticker and so
+/// reaches provider URLs, which the ticker check alone cannot protect.
+fn validate_exchange(value: &str) -> Result<String, IdxError> {
+    let trimmed = value.trim().to_ascii_uppercase();
+    if (1..=4).contains(&trimmed.len()) && trimmed.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Ok(trimmed)
+    } else {
+        Err(IdxError::InvalidInput(format!(
+            "invalid exchange '{value}': expected 1-4 letters or digits, such as JK"
+        )))
+    }
 }
 
 pub fn config_path() -> Result<PathBuf, IdxError> {
@@ -251,7 +264,11 @@ pub fn get_config_value(key: &str) -> Result<Option<String>, IdxError> {
         };
         cur = next;
     }
-    Ok(Some(cur.to_string().trim_matches('"').to_string()))
+    // A string as written (not TOML-escaped: `C:\x` stays `C:\x`).
+    Ok(Some(match cur.as_str() {
+        Some(text) => text.to_string(),
+        None => cur.to_string(),
+    }))
 }
 
 /// Known configuration keys and their valid values
@@ -301,10 +318,7 @@ fn normalize_config_value(key: &str, value: &str) -> Result<toml::Value, IdxErro
             }
             Ok(toml::Value::Integer(parsed))
         }
-        "general.exchange" => {
-            // Exchange is free-form (e.g. JK, US, etc.)
-            Ok(toml::Value::String(value.to_string()))
-        }
+        "general.exchange" => Ok(toml::Value::String(validate_exchange(value)?)),
         "ownership.db_path" => {
             // Ownership DB path is free-form and may be absolute or relative.
             Ok(toml::Value::String(value.to_string()))
@@ -368,6 +382,14 @@ pub fn set_config_value(key: &str, value: &str) -> Result<(), IdxError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exchange_must_be_a_short_code() {
+        assert_eq!(super::validate_exchange(" jk ").unwrap(), "JK");
+        for bad in ["", "JK?x=1", "JK/../..", "TOOLONG"] {
+            assert!(super::validate_exchange(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn default_values_are_sane() {
         let cfg = super::CoreConfig::default();
