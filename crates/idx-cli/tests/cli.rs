@@ -2359,3 +2359,45 @@ fn closed_stdout_pipe_ends_quietly_instead_of_panicking() {
         "{output:?}"
     );
 }
+
+#[test]
+fn ownership_sync_force_replaces_an_unreadable_database() {
+    let publisher_root = test_env_dir("ownership-sync-force-publisher");
+    let (source_db, manifest_path) = prepare_snapshot_fixture(&publisher_root);
+    // Uppercase hex in the manifest is the same checksum.
+    let bytes = fs::read(&source_db).unwrap();
+    write_snapshot_manifest(
+        &manifest_path,
+        &source_db,
+        Some(&sha256_hex(&bytes).to_ascii_uppercase()),
+    );
+
+    let sync_root = test_env_dir("ownership-sync-force-consumer");
+    let target_db = sync_root.join("ownership.db");
+    fs::write(&target_db, b"not a database, just a truncated download").unwrap();
+    for (key, value) in [
+        ("ownership.db_path", target_db.to_str().unwrap()),
+        (
+            "ownership.snapshot_manifest",
+            manifest_path.to_str().unwrap(),
+        ),
+    ] {
+        run_success_stdout(bin_with_root(&sync_root).args(["config", "set", key, value]));
+    }
+
+    // Without --force the unreadable file is reported, not replaced.
+    bin_with_root(&sync_root)
+        .args(["-o", "json", "ownership", "sync"])
+        .assert()
+        .failure();
+    let report = run_success_json(bin_with_root(&sync_root).args([
+        "-o",
+        "json",
+        "ownership",
+        "sync",
+        "--force",
+    ]));
+    assert_eq!(report["reason"], "force refresh requested", "{report}");
+    assert_eq!(fs::read(&target_db).unwrap(), bytes);
+    run_success_json(bin_with_root(&sync_root).args(["-o", "json", "ownership", "releases"]));
+}
