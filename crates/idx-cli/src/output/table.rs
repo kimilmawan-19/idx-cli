@@ -25,6 +25,26 @@ pub fn format_idr(value: i64) -> String {
     format!("{sign}{}", out.chars().rev().collect::<String>())
 }
 
+/// Statement line items are mostly whole rupiah, but per-share and ratio
+/// items (EPS 467.9) lost their fraction to an `as i64` truncation.
+fn format_statement_value(value: f64) -> String {
+    if !value.is_finite() {
+        return "-".to_string();
+    }
+    if value.fract() == 0.0 {
+        return format_idr(value as i64);
+    }
+    let rounded = (value * 100.0).round() / 100.0;
+    let whole = format_idr(rounded.trunc() as i64);
+    let cents = ((rounded.abs().fract()) * 100.0).round() as i64;
+    let sign = if rounded < 0.0 && rounded.trunc() == 0.0 {
+        "-"
+    } else {
+        ""
+    };
+    format!("{sign}{whole}.{cents:02}")
+}
+
 pub fn format_u64(value: u64) -> String {
     format_idr(value as i64)
 }
@@ -723,7 +743,10 @@ pub fn print_financials(fin: &FinancialStatements) -> Result<(), IdxError> {
         entries.sort_by(|(left, _), (right, _)| left.cmp(right));
 
         for (label, value) in entries {
-            t.add_row(vec![Cell::new(label), Cell::new(format_idr(*value as i64))]);
+            t.add_row(vec![
+                Cell::new(label),
+                Cell::new(format_statement_value(*value)),
+            ]);
         }
         println!("{t}");
     };
@@ -888,8 +911,8 @@ fn truncate_chars(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_earnings_period, format_idr, format_signal, format_table_date, format_u64,
-        humanize_metric_key, stale_quote_notes, truncate_chars,
+        format_earnings_period, format_idr, format_signal, format_statement_value,
+        format_table_date, format_u64, humanize_metric_key, stale_quote_notes, truncate_chars,
     };
     use idx_core::analysis::signals::Signal;
     use idx_core::api::types::Quote;
@@ -976,5 +999,14 @@ mod tests {
         );
         assert_eq!(truncate_chars("short", 200), "short");
         assert_eq!(format_earnings_period("Qé123"), "Qé123");
+    }
+
+    #[test]
+    fn statement_values_keep_their_fraction() {
+        assert_eq!(format_statement_value(1_234_567.0), "1,234,567");
+        assert_eq!(format_statement_value(467.9), "467.90");
+        assert_eq!(format_statement_value(-0.25), "-0.25");
+        assert_eq!(format_statement_value(-1_500.125), "-1,500.13");
+        assert_eq!(format_statement_value(f64::NAN), "-");
     }
 }
