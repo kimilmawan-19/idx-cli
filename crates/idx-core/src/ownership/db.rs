@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 use directories::ProjectDirs;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, DatabaseName, params};
 
 use crate::config::get_config_value;
 use crate::error::IdxError;
@@ -34,14 +34,6 @@ CREATE TABLE IF NOT EXISTS entities (
     country         TEXT,
     created_at      INTEGER NOT NULL,
     updated_at      INTEGER NOT NULL
-);
-
-CREATE VIRTUAL TABLE IF NOT EXISTS entity_fts USING fts5(
-    canonical_name,
-    aliases,
-    content='entities',
-    content_rowid='id',
-    tokenize='trigram'
 );
 
 CREATE TABLE IF NOT EXISTS entity_aliases (
@@ -105,6 +97,18 @@ CREATE INDEX IF NOT EXISTS idx_bing_entity ON bing_holdings(entity_id);
 CREATE INDEX IF NOT EXISTS idx_bing_date ON bing_holdings(report_date);
 "#;
 
+/// Schema version 2: entity search index. Version 1 declared it as an
+/// external-content table over `entities`, which has no `aliases` column, so
+/// every read and rebuild failed. A standalone table owns its text instead.
+pub const SCHEMA_V2: &str = r#"
+DROP TABLE IF EXISTS entity_fts;
+CREATE VIRTUAL TABLE entity_fts USING fts5(
+    canonical_name,
+    aliases,
+    tokenize='trigram'
+);
+"#;
+
 /// Ensure ownership schema is migrated and ready for use.
 pub fn ensure_schema(conn: &Connection) -> Result<(), IdxError> {
     let user_version: i64 = conn
@@ -124,7 +128,30 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), IdxError> {
             .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
     }
 
+    // A read-only database (snapshot on a read-only filesystem) keeps the old
+    // index; search falls back to LIKE there.
+    if user_version < 2 && !conn.is_readonly(DatabaseName::Main).unwrap_or(false) {
+        migrate_v2(conn)?;
+    }
+
     Ok(())
+}
+
+fn migrate_v2(conn: &Connection) -> Result<(), IdxError> {
+    let db_err = |e: rusqlite::Error| IdxError::DatabaseError(e.to_string());
+    conn.execute_batch("SAVEPOINT schema_v2").map_err(db_err)?;
+    let result = (|| {
+        conn.execute_batch(SCHEMA_V2).map_err(db_err)?;
+        search::rebuild_fts(conn)?;
+        conn.pragma_update(None, "user_version", 2).map_err(db_err)
+    })();
+    match result {
+        Ok(()) => conn.execute_batch("RELEASE schema_v2").map_err(db_err),
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK TO schema_v2; RELEASE schema_v2");
+            Err(err)
+        }
+    }
 }
 
 /// Open ownership database connection and run idempotent schema migration.
@@ -339,17 +366,37 @@ pub fn insert_release(conn: &Connection, release: &OwnershipRelease) -> Result<i
     Ok(conn.last_insert_rowid())
 }
 
+/// Run `f` atomically. A SAVEPOINT nests, so callers can group several of
+/// these (an import wraps entity resolution and the release write in one).
+pub(crate) fn in_transaction<T>(
+    conn: &Connection,
+    f: impl FnOnce() -> Result<T, IdxError>,
+) -> Result<T, IdxError> {
+    conn.execute_batch("SAVEPOINT idx_tx")
+        .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
+    match f() {
+        Ok(value) => {
+            conn.execute_batch("RELEASE idx_tx")
+                .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
+            Ok(value)
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK TO idx_tx; RELEASE idx_tx");
+            Err(err)
+        }
+    }
+}
+
 /// Insert or replace a complete KSEI release and its rows atomically.
+/// The release records the rows actually stored: duplicate rows (same
+/// ticker and raw investor name) are kept once.
 pub fn write_ksei_release(
     conn: &Connection,
     release: &OwnershipRelease,
     holdings: &[KseiHolding],
     replace_existing: bool,
 ) -> Result<usize, IdxError> {
-    conn.execute("BEGIN IMMEDIATE", [])
-        .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
-
-    let result = (|| {
+    in_transaction(conn, || {
         if replace_existing {
             conn.execute(
                 "DELETE FROM ksei_holdings WHERE release_sha256 = ?1",
@@ -364,21 +411,13 @@ pub fn write_ksei_release(
         }
 
         let inserted = insert_ksei_holdings_rows(conn, holdings)?;
-        let _ = insert_release(conn, release)?;
+        let stored = OwnershipRelease {
+            row_count: inserted,
+            ..release.clone()
+        };
+        let _ = insert_release(conn, &stored)?;
         Ok(inserted)
-    })();
-
-    match result {
-        Ok(inserted) => {
-            conn.execute("COMMIT", [])
-                .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
-            Ok(inserted)
-        }
-        Err(err) => {
-            let _ = conn.execute("ROLLBACK", []);
-            Err(err)
-        }
-    }
+    })
 }
 
 /// Check if a release with this SHA-256 already exists.
@@ -1123,7 +1162,7 @@ pub fn manual_map(conn: &Connection, raw_name: &str, canonical_name: &str) -> Re
         )
         .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
-        let _ = search::rebuild_fts(conn);
+        search::rebuild_fts(conn)?;
         Ok(())
     })();
 
@@ -1194,7 +1233,7 @@ pub fn merge_entities(conn: &Connection, keep_id: i64, merge_id: i64) -> Result<
         conn.execute("DELETE FROM entities WHERE id = ?1", params![merge_id])
             .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
-        let _ = search::rebuild_fts(conn);
+        search::rebuild_fts(conn)?;
         Ok(())
     })();
 

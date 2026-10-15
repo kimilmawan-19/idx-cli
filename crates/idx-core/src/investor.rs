@@ -135,10 +135,10 @@ impl Investor {
     /// canonical name containing it).
     pub fn entity(&self, name: &str) -> Result<EntityHoldings, IdxError> {
         let conn = self.connect()?;
-        let pattern = format!("%{}%", name.trim());
+        let pattern = search::like_pattern(name.trim());
         let entity_id = conn
             .query_row(
-                "SELECT id FROM entities WHERE canonical_name LIKE ?1 COLLATE NOCASE ORDER BY LENGTH(canonical_name) ASC LIMIT 1",
+                "SELECT id FROM entities WHERE canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE ORDER BY LENGTH(canonical_name) ASC LIMIT 1",
                 rusqlite::params![pattern],
                 |row| row.get::<_, i64>(0),
             )
@@ -291,55 +291,64 @@ impl Investor {
             ImportFormat::Xlsx => xlsx::parse_above1_xlsx_file(&input.path)?,
         };
 
-        let mut holdings = Vec::with_capacity(drafts.len());
-        let mut ticker_ids = HashSet::new();
-        for draft in drafts {
-            let ticker_id =
-                db::upsert_ticker(&conn, &draft.ticker_code, draft.issuer_name.as_deref())?;
-            let entity_id =
-                entities::resolve_entity(&conn, &draft.raw_investor_name, OwnershipSource::Ksei)?;
-            ticker_ids.insert(ticker_id);
-            holdings.push(KseiHolding {
+        // One transaction: a failed release write leaves no orphan tickers,
+        // entities or aliases behind.
+        let (release, inserted_rows, ticker_count) = db::in_transaction(&conn, || {
+            let mut holdings = Vec::with_capacity(drafts.len());
+            let mut ticker_ids = HashSet::new();
+            for draft in drafts {
+                let ticker_id =
+                    db::upsert_ticker(&conn, &draft.ticker_code, draft.issuer_name.as_deref())?;
+                let entity_id = entities::resolve_entity(
+                    &conn,
+                    &draft.raw_investor_name,
+                    OwnershipSource::Ksei,
+                )?;
+                ticker_ids.insert(ticker_id);
+                holdings.push(KseiHolding {
+                    id: 0,
+                    ticker_id,
+                    entity_id: Some(entity_id),
+                    raw_investor_name: draft.raw_investor_name,
+                    investor_type: draft.investor_type,
+                    locality: draft.locality,
+                    nationality: draft.nationality,
+                    domicile: draft.domicile,
+                    holdings_scripless: draft.holdings_scripless,
+                    holdings_scrip: draft.holdings_scrip,
+                    total_shares: draft.total_shares,
+                    percentage_bps: draft.percentage_bps,
+                    report_date: draft.report_date,
+                    release_sha256: sha256.clone(),
+                });
+            }
+
+            let as_of_date = holdings
+                .iter()
+                .map(|h| h.report_date)
+                .max()
+                .ok_or_else(|| {
+                    IdxError::ParseError("missing report_date in parsed holdings".to_string())
+                })?;
+
+            let release = OwnershipRelease {
                 id: 0,
-                ticker_id,
-                entity_id: Some(entity_id),
-                raw_investor_name: draft.raw_investor_name,
-                investor_type: draft.investor_type,
-                locality: draft.locality,
-                nationality: draft.nationality,
-                domicile: draft.domicile,
-                holdings_scripless: draft.holdings_scripless,
-                holdings_scrip: draft.holdings_scrip,
-                total_shares: draft.total_shares,
-                percentage_bps: draft.percentage_bps,
-                report_date: draft.report_date,
-                release_sha256: sha256.clone(),
-            });
-        }
-
-        let as_of_date = holdings
-            .iter()
-            .map(|h| h.report_date)
-            .max()
-            .ok_or_else(|| {
-                IdxError::ParseError("missing report_date in parsed holdings".to_string())
-            })?;
-
-        let release = OwnershipRelease {
-            id: 0,
-            source_url: input.source_url,
-            sha256,
-            as_of_date,
-            row_count: holdings.len(),
-            imported_at: Utc::now().timestamp(),
-        };
-        let inserted_rows = db::write_ksei_release(&conn, &release, &holdings, force)?;
+                source_url: input.source_url,
+                sha256,
+                as_of_date,
+                row_count: holdings.len(),
+                imported_at: Utc::now().timestamp(),
+            };
+            let inserted_rows = db::write_ksei_release(&conn, &release, &holdings, force)?;
+            search::rebuild_fts(&conn)?;
+            Ok((release, inserted_rows, ticker_ids.len()))
+        })?;
 
         Ok(ImportResult {
             action: if force { "reimported" } else { "imported" },
             inserted_rows,
-            ticker_count: ticker_ids.len(),
-            as_of_date: Some(as_of_date.format("%Y-%m-%d").to_string()),
+            ticker_count,
+            as_of_date: Some(release.as_of_date.format("%Y-%m-%d").to_string()),
             sha256: release.sha256,
             source_url: release.source_url,
         })
@@ -624,6 +633,14 @@ fn validate_import_url(url: &str) -> Result<ImportFormat, IdxError> {
     }
 
     let normalized = trimmed.to_ascii_lowercase();
+    if normalized.starts_with("http://www.idx.co.id/")
+        || normalized.starts_with("http://idx.co.id/")
+    {
+        // A plain-HTTP report can be rewritten in transit; IDX serves https.
+        return Err(IdxError::InvalidInput(
+            "ownership import --url needs https:// for idx.co.id".to_string(),
+        ));
+    }
     let normalized = normalized
         .split(['?', '#'])
         .next()
@@ -648,7 +665,8 @@ fn download_pdf(url: &str, target: &Path) -> Result<(), IdxError> {
         return remote::download_idx_pdf(url, target);
     }
 
-    let response = ureq::get(url)
+    let response = download_agent()
+        .get(url)
         .header(
             "User-Agent",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -680,7 +698,8 @@ fn download_xlsx(url: &str, target: &Path) -> Result<(), IdxError> {
         return remote::download_idx_xlsx(url, target);
     }
 
-    let response = ureq::get(url)
+    let response = download_agent()
+        .get(url)
         .header(
             "Accept",
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/octet-stream,*/*;q=0.8",
@@ -705,10 +724,16 @@ fn download_xlsx(url: &str, target: &Path) -> Result<(), IdxError> {
 
 fn is_idx_url(url: &str) -> bool {
     let normalized = url.trim().to_ascii_lowercase();
-    normalized.starts_with("https://www.idx.co.id/")
-        || normalized.starts_with("http://www.idx.co.id/")
-        || normalized.starts_with("https://idx.co.id/")
-        || normalized.starts_with("http://idx.co.id/")
+    normalized.starts_with("https://www.idx.co.id/") || normalized.starts_with("https://idx.co.id/")
+}
+
+/// Non-IDX downloads give up rather than hang, like snapshot sync.
+fn download_agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .timeout_global(Some(std::time::Duration::from_secs(600)))
+        .build()
+        .into()
 }
 
 fn sha256_file(path: &Path) -> Result<String, IdxError> {
@@ -726,8 +751,19 @@ fn sha256_file(path: &Path) -> Result<String, IdxError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConcentrationRank, HolderSource, parse_report_family};
+    use super::{ConcentrationRank, HolderSource, parse_report_family, validate_import_url};
+    use crate::error::IdxError;
     use crate::ownership::remote::OwnershipReportFamily;
+
+    #[test]
+    fn idx_report_urls_must_use_https() {
+        let err = validate_import_url("http://www.idx.co.id/Media/report.xlsx").unwrap_err();
+        assert!(matches!(err, IdxError::InvalidInput(_)), "{err:?}");
+        assert!(validate_import_url("HTTP://IDX.CO.ID/report.pdf").is_err());
+        assert!(validate_import_url("https://www.idx.co.id/Media/report.xlsx").is_ok());
+        // Other hosts are the user's own choice (and local test servers).
+        assert!(validate_import_url("http://127.0.0.1:8080/report.pdf").is_ok());
+    }
 
     #[test]
     fn parses_holder_sources_and_ranks() {
