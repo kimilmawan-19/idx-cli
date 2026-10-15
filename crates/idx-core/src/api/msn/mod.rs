@@ -115,6 +115,6 @@ impl ScreenerProvider for MsnProvider {
         limit: Option<usize>,
     ) -> Result<Vec<Quote>, IdxError> {
         let raw = self.client.fetch_screener(filter, region, limit)?;
-        parse_screener_results(&raw)
+        parse_screener_results(&raw, region)
     }
 }

@@ -331,7 +331,9 @@ impl MsnClient {
                 key: "st_1yr_asc_order".to_string(),
                 dir: "desc".to_string(),
             },
-            return_value_type: vec!["quote".to_string(), "equity".to_string()],
+            // Only quotes are parsed; adding "equity" made full US/JP lists
+            // ~20 MB, past ureq's 10 MB body limit.
+            return_value_type: vec!["quote".to_string()],
             screener_type: "stock".to_string(),
             limit: limit.unwrap_or(500),
             page_index: 0,

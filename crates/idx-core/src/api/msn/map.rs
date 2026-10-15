@@ -577,11 +577,22 @@ pub(super) fn parse_news(symbol: &str, raw: &RawNewsFeed) -> Result<Vec<NewsItem
         .collect())
 }
 
-pub(super) fn parse_screener_results(raw: &RawScreenerResponse) -> Result<Vec<Quote>, IdxError> {
+/// `region` is the MSN region key; only IDX (`st_reg_id`) symbols get the
+/// `.JK` suffix, other markets keep MSN's symbol as is.
+pub(super) fn parse_screener_results(
+    raw: &RawScreenerResponse,
+    region: &str,
+) -> Result<Vec<Quote>, IdxError> {
     let quotes = raw
         .quote
         .as_ref()
         .ok_or_else(|| IdxError::ParseError("no screener data".into()))?;
+    // An empty list is a valid answer (MSN currently has no low-P/E list
+    // for Indonesia), not a parse failure.
+    if quotes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let idx_region = region == "st_reg_id";
 
     let results: Vec<Quote> = quotes
         .iter()
@@ -592,11 +603,17 @@ pub(super) fn parse_screener_results(raw: &RawScreenerResponse) -> Result<Vec<Qu
             let change = prev_close
                 .map(|pc| price - pc)
                 .or_else(|| q.price_change.map(round_price));
-            let ticker = q
-                .symbol
-                .as_deref()
-                .and_then(ticker_from_symbol)
-                .filter(|ticker| !ticker.is_empty())?;
+            let symbol = if idx_region {
+                let ticker = q
+                    .symbol
+                    .as_deref()
+                    .and_then(ticker_from_symbol)
+                    .filter(|ticker| !ticker.is_empty())?;
+                normalized_symbol(&ticker, &ticker)
+            } else {
+                let symbol = q.symbol.as_deref()?.trim().to_uppercase();
+                (!symbol.is_empty()).then_some(symbol)?
+            };
             let (week52_position, range_signal) = match (q.price_52w_low, q.price_52w_high) {
                 (Some(low), Some(high)) if high > low => {
                     let pos = (raw_price - low) / (high - low);
@@ -612,7 +629,7 @@ pub(super) fn parse_screener_results(raw: &RawScreenerResponse) -> Result<Vec<Qu
                 _ => (None, None),
             };
             Some(Quote {
-                symbol: normalized_symbol(&ticker, &ticker),
+                symbol,
                 price,
                 change,
                 change_pct: q.price_change_percent,
@@ -861,7 +878,7 @@ mod tests {
         ))
         .expect("screener fixture should deserialize");
 
-        let quotes = parse_screener_results(&raw).expect("screener should parse");
+        let quotes = parse_screener_results(&raw, "st_reg_id").expect("screener should parse");
 
         assert_eq!(quotes.len(), 2);
         assert_eq!(quotes[0].symbol, "BBCA.JK");
@@ -886,11 +903,35 @@ mod tests {
         )
         .expect("screener fixture should deserialize");
 
-        let quotes = parse_screener_results(&raw).expect("screener should parse");
+        let quotes = parse_screener_results(&raw, "st_reg_id").expect("screener should parse");
 
         assert_eq!(quotes.len(), 1);
         assert_eq!(quotes[0].symbol, "BBCA.JK");
         assert_eq!(quotes[0].price, 9_875);
+    }
+
+    #[test]
+    fn parse_screener_results_keeps_foreign_symbols_without_jk() {
+        let raw: RawScreenerResponse = serde_json::from_str(
+            r#"{ "quote": [
+                { "symbol": "IAG", "price": 17 },
+                { "symbol": "brk.b", "price": 480 }
+            ] }"#,
+        )
+        .expect("screener fixture should deserialize");
+
+        let quotes = parse_screener_results(&raw, "st_reg_us").expect("screener should parse");
+        let symbols: Vec<_> = quotes.iter().map(|q| q.symbol.as_str()).collect();
+        assert_eq!(symbols, ["IAG", "BRK.B"]);
+    }
+
+    #[test]
+    fn parse_screener_results_empty_list_is_no_results() {
+        let raw: RawScreenerResponse =
+            serde_json::from_str(r#"{ "count": 0, "quote": [] }"#).expect("deserialize");
+
+        let quotes = parse_screener_results(&raw, "st_reg_id").expect("empty list is valid");
+        assert!(quotes.is_empty());
     }
 
     #[test]
@@ -905,7 +946,8 @@ mod tests {
         )
         .expect("screener fixture should deserialize");
 
-        let err = parse_screener_results(&raw).expect_err("invalid screener rows should fail");
+        let err = parse_screener_results(&raw, "st_reg_id")
+            .expect_err("invalid screener rows should fail");
 
         assert!(matches!(err, IdxError::ParseError(_)));
         assert_eq!(
