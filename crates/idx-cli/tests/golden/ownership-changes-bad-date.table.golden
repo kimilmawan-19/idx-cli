@@ -1,0 +1,4 @@
+exit: 2
+--- stdout
+--- stderr
+Error: invalid input: --from must be a YYYY-MM-DD date, got '30-01-2026'

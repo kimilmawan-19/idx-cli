@@ -1,0 +1,4 @@
+exit: 3
+--- stdout
+--- stderr
+Error: no market data: no ownership report dated 2026-01-15 (--from); see `idx ownership releases`

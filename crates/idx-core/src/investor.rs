@@ -182,7 +182,28 @@ impl Investor {
         to: &str,
         ticker: Option<&str>,
     ) -> Result<Vec<ChangeRow>, IdxError> {
-        let mut rows = db::query_changes(&*self.connect()?, from, to)?;
+        let conn = self.connect()?;
+        // A mistyped date (27-02-2026) or one with no report matched nothing
+        // and printed "no changes", or reported every holder as new.
+        for (flag, date) in [("--from", from), ("--to", to)] {
+            NaiveDate::parse_from_str(date.trim(), "%Y-%m-%d").map_err(|_| {
+                IdxError::InvalidInput(format!("{flag} must be a YYYY-MM-DD date, got '{date}'"))
+            })?;
+            let known: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM ksei_holdings WHERE report_date = ?1)",
+                    rusqlite::params![date.trim()],
+                    |row| row.get(0),
+                )
+                .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
+            if !known {
+                return Err(IdxError::NoMarketData(format!(
+                    "no ownership report dated {} ({flag}); see `idx ownership releases`",
+                    date.trim()
+                )));
+            }
+        }
+        let mut rows = db::query_changes(&conn, from.trim(), to.trim())?;
         if let Some(ticker) = ticker {
             let ticker = ticker.trim().to_uppercase();
             rows.retain(|row| row.ticker_code == ticker);
