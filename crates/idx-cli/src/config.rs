@@ -61,6 +61,10 @@ impl IdxConfig {
         if let Ok(value) = std::env::var("IDX_NO_COLOR") {
             no_color = value == "1" || value.eq_ignore_ascii_case("true");
         }
+        // The cross-tool convention (no-color.org): any non-empty value.
+        if std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty()) {
+            no_color = true;
+        }
 
         if let Some(setting) = cli.output {
             output = setting.resolve(stdout_is_terminal());

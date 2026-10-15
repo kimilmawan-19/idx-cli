@@ -2401,3 +2401,26 @@ fn ownership_sync_force_replaces_an_unreadable_database() {
     assert_eq!(fs::read(&target_db).unwrap(), bytes);
     run_success_json(bin_with_root(&sync_root).args(["-o", "json", "ownership", "releases"]));
 }
+
+#[test]
+fn trailing_comma_in_symbol_list_is_ignored() {
+    let report = run_success_json(
+        test_bin("quote-trailing-comma")
+            .env("IDX_USE_MOCK_PROVIDER", "1")
+            .args(["-o", "json", "stocks", "quote", "BBCA,"]),
+    );
+    assert_eq!(report.as_array().map(Vec::len), Some(1), "{report}");
+    assert_eq!(report[0]["symbol"], "BBCA.JK");
+}
+
+#[test]
+fn invalid_exchange_is_rejected_before_any_request() {
+    test_bin("invalid-exchange")
+        .env("IDX_USE_MOCK_PROVIDER", "1")
+        .env("IDX_EXCHANGE", "JK?x=1")
+        .args(["-o", "json", "stocks", "quote", "BBCA"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains("invalid exchange"));
+}
