@@ -954,9 +954,9 @@ Arguments:
   <ROOT>  Ticker code or entity name to start from
 
 Options:
-      --depth <DEPTH>    Traversal depth (default 2) [default: 2]
+      --depth <DEPTH>    Traversal depth, 1 to 4 (default 2) [default: 2]
   -o, --output <OUTPUT>  Output format [default: auto = table on a terminal, json when piped] [possible values: auto, table, json, jsonl]
-      --format <FORMAT>  Output format: table or dot (Graphviz) [default: table]
+      --format <FORMAT>  Graph format: table, or dot (Graphviz), which is written as DOT even when stdout is piped [default: table, or JSON when piped] [possible values: table, dot]
       --no-color         Disable colored output
   -q, --quiet            Suppress non-essential output
   -v, --verbose...       Increase verbosity (-v, -vv)
