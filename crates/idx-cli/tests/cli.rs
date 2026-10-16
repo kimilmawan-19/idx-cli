@@ -2539,3 +2539,122 @@ fn ownership_archive_only_database_rejects_entity_level_commands() {
     ]));
     assert!(changes.as_array().is_some_and(|rows| !rows.is_empty()));
 }
+
+#[test]
+fn ownership_ticker_prefers_the_register_over_archives() {
+    let root = test_env_dir("ticker-prefers-register");
+    prepare_snapshot_fixture(&root);
+    let ticker_json = |root: &Path| {
+        run_success_json(bin_with_root(root).args([
+            "-o",
+            "json",
+            "ownership",
+            "ticker",
+            "AADI",
+            "--source",
+            "ksei",
+        ]))
+    };
+    let before = ticker_json(&root);
+    assert_eq!(before["ksei_as_of"], "2026-02-27");
+    assert!(before.get("ksei_aggregate").is_none(), "{before}");
+    assert!(before.get("newer_aggregate_as_of").is_none(), "{before}");
+
+    let jan = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt");
+    let feb = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt");
+    // Older, and the same date as the Feb register but imported later.
+    import_archive_text(&root, "Balancepos20260130.txt", jan);
+    import_archive_text(&root, "Balancepos20260227.txt", feb);
+    assert_eq!(ticker_json(&root), before);
+    bin_with_root(&root)
+        .args(["ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stderr("");
+
+    // Newer than every register: still not shown, but said.
+    import_archive_text(
+        &root,
+        "Balancepos20260331.txt",
+        &feb.replace("27-FEB-2026", "31-MAR-2026"),
+    );
+    let mut expected = before.clone();
+    expected["newer_aggregate_as_of"] = serde_json::json!("2026-03-31");
+    assert_eq!(ticker_json(&root), expected);
+
+    bin_with_root(&root)
+        .args(["ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "a newer KSEI archive (2026-03-31)",
+        ))
+        .stderr(predicate::str::contains(
+            "showing the holder register (2026-02-27)",
+        ));
+    bin_with_root(&root)
+        .args(["--quiet", "ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stderr("");
+    // Nothing on stderr in JSON mode: the document says it.
+    bin_with_root(&root)
+        .args([
+            "-o",
+            "json",
+            "ownership",
+            "ticker",
+            "AADI",
+            "--source",
+            "ksei",
+        ])
+        .assert()
+        .success()
+        .stderr("");
+}
+
+#[test]
+fn ownership_ticker_on_an_archive_only_database_says_what_it_shows() {
+    let root = test_env_dir("ticker-archive-only");
+    let db_path = root.join("ownership.db");
+    run_success_stdout(bin_with_root(&root).args([
+        "config",
+        "set",
+        "ownership.db_path",
+        db_path.to_str().unwrap(),
+    ]));
+    import_archive_text(
+        &root,
+        "Balancepos20260227.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt"),
+    );
+
+    let ticker = run_success_json(bin_with_root(&root).args([
+        "-o",
+        "json",
+        "ownership",
+        "ticker",
+        "AADI",
+        "--source",
+        "ksei",
+    ]));
+    assert_eq!(ticker["ksei_aggregate"], true, "{ticker}");
+    assert!(ticker.get("newer_aggregate_as_of").is_none(), "{ticker}");
+    let holders = ticker["holders"].as_array().unwrap();
+    assert_eq!(holders.len(), 18);
+    assert!(holders.iter().all(|row| row["entity_id"].is_null()));
+
+    bin_with_root(&root)
+        .args(["ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("KSEI AGGREGATE LOCAL CP"))
+        .stderr(predicate::str::contains(
+            "showing KSEI archive totals per investor type and locality",
+        ));
+    bin_with_root(&root)
+        .args(["--quiet", "ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stderr("");
+}

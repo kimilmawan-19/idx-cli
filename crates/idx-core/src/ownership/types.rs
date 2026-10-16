@@ -280,6 +280,14 @@ pub struct TickerOwnership {
     pub ksei_as_of: Option<NaiveDate>,
     /// Latest Bing reporting period label.
     pub bing_as_of: Option<String>,
+    /// The KSEI rows are archive totals per investor type and locality, not
+    /// named holders: the database has no holder register. Absent otherwise.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ksei_aggregate: bool,
+    /// Date of a KSEI archive newer than the register shown. `ticker` does
+    /// not use it: archive totals are not holders. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer_aggregate_as_of: Option<NaiveDate>,
     /// Combined holder rows for display.
     pub holders: Vec<HolderRow>,
     /// Concentration metrics calculated for the ticker.
