@@ -135,6 +135,7 @@ impl Investor {
     /// canonical name containing it).
     pub fn entity(&self, name: &str) -> Result<EntityHoldings, IdxError> {
         let conn = self.connect()?;
+        db::require_holder_release(&conn)?;
         let entity_id = db::find_entity_id_by_name(&conn, name)?
             .ok_or_else(|| IdxError::ParseError(format!("entity not found: {name}")))?;
         db::query_entity_holdings(&conn, entity_id)
@@ -149,7 +150,9 @@ impl Investor {
         min_tickers: usize,
         top: usize,
     ) -> Result<Vec<CrossHolderRow>, IdxError> {
-        db::query_cross_holders(&*self.connect()?, min_tickers, top)
+        let conn = self.connect()?;
+        db::require_holder_release(&conn)?;
+        db::query_cross_holders(&conn, min_tickers, top)
     }
 
     pub fn concentration(
@@ -157,7 +160,9 @@ impl Investor {
         by: ConcentrationRank,
         top: usize,
     ) -> Result<Vec<(String, ConcentrationMetrics)>, IdxError> {
-        db::query_concentration(&*self.connect()?, by.as_str(), top)
+        let conn = self.connect()?;
+        db::require_holder_release(&conn)?;
+        db::query_concentration(&conn, by.as_str(), top)
     }
 
     /// Institutional (Bing) flow; `None` when no flow data exists.
@@ -210,7 +215,9 @@ impl Investor {
         root: &str,
         depth: usize,
     ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>), IdxError> {
-        graph::query_ownership_graph(&*self.connect()?, root, depth)
+        let conn = self.connect()?;
+        db::require_holder_release(&conn)?;
+        graph::query_ownership_graph(&conn, root, depth)
     }
 
     pub fn unresolved(&self, limit: usize) -> Result<Vec<UnresolvedRow>, IdxError> {

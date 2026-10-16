@@ -181,14 +181,8 @@ fn detect_root_node(conn: &Connection, root: &str) -> Result<String, IdxError> {
 fn query_all_edges(conn: &Connection) -> Result<Vec<GraphEdge>, IdxError> {
     let mut out = Vec::new();
 
-    if let Ok(release_sha) = conn.query_row(
-        "SELECT sha256
-             FROM ownership_releases
-             ORDER BY as_of_date DESC, imported_at DESC
-             LIMIT 1",
-        [],
-        |row| row.get::<_, String>(0),
-    ) {
+    if let Some(release) = crate::ownership::db::latest_holder_release(conn)? {
+        let release_sha = release.sha256;
         let mut stmt = conn
             .prepare(
                 "SELECT 'entity:' || k.entity_id,

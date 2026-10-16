@@ -2424,3 +2424,118 @@ fn invalid_exchange_is_rejected_before_any_request() {
         .stdout("")
         .stderr(predicate::str::contains("invalid exchange"));
 }
+
+/// What the entity-level commands print for a database (one JSON document
+/// each), in a fixed order.
+fn entity_level_outputs(root: &Path) -> Vec<String> {
+    [
+        vec![
+            "-o",
+            "json",
+            "ownership",
+            "cross-holders",
+            "--min-tickers",
+            "1",
+            "--top",
+            "20",
+        ],
+        vec!["-o", "json", "ownership", "concentration", "--top", "5"],
+        vec!["-o", "json", "ownership", "entity", "ADARO STRATEGIC"],
+        vec!["-o", "json", "ownership", "graph", "AADI", "--depth", "2"],
+        vec!["-o", "json", "ownership", "search", "adaro"],
+    ]
+    .iter()
+    .map(|args| run_success_stdout(bin_with_root(root).args(args)))
+    .collect()
+}
+
+fn import_archive_text(root: &Path, file_name: &str, text: &str) {
+    let path = root.join(file_name);
+    fs::write(&path, text).expect("write archive fixture");
+    run_success_stdout(bin_with_root(root).args([
+        "ownership",
+        "import",
+        "--file",
+        path.to_str().unwrap(),
+    ]));
+}
+
+#[test]
+fn ownership_archives_never_shadow_the_register() {
+    let root = test_env_dir("archives-never-shadow-register");
+    prepare_snapshot_fixture(&root);
+    let before = entity_level_outputs(&root);
+
+    let jan = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt");
+    let feb = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt");
+    // Older than the registers; the same date as the Feb register but imported
+    // later (it used to win on import time); and newer than every register.
+    import_archive_text(&root, "Balancepos20260130.txt", jan);
+    import_archive_text(&root, "Balancepos20260227.txt", feb);
+    import_archive_text(
+        &root,
+        "Balancepos20260331.txt",
+        &feb.replace("27-FEB-2026", "31-MAR-2026"),
+    );
+
+    let releases =
+        run_success_json(bin_with_root(&root).args(["-o", "json", "ownership", "releases"]));
+    assert_eq!(releases.as_array().unwrap().len(), 5, "{releases}");
+    assert_eq!(releases[0]["as_of_date"], "2026-03-31");
+    assert_eq!(entity_level_outputs(&root), before);
+}
+
+#[test]
+fn ownership_archive_only_database_rejects_entity_level_commands() {
+    let root = test_env_dir("archive-only-entity-level");
+    let db_path = root.join("ownership.db");
+    run_success_stdout(bin_with_root(&root).args([
+        "config",
+        "set",
+        "ownership.db_path",
+        db_path.to_str().unwrap(),
+    ]));
+    import_archive_text(
+        &root,
+        "Balancepos20260130.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt"),
+    );
+    import_archive_text(
+        &root,
+        "Balancepos20260227.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt"),
+    );
+
+    for args in [
+        vec!["cross-holders"],
+        vec!["concentration"],
+        vec!["entity", "ADARO"],
+        vec!["graph", "AADI"],
+    ] {
+        let mut full = vec!["-o", "json", "ownership"];
+        full.extend(args);
+        run_error_json(bin_with_root(&root).args(full), "NOMARKETDATA");
+    }
+    bin_with_root(&root)
+        .args(["ownership", "cross-holders"])
+        .assert()
+        .code(3)
+        .stdout("")
+        .stderr(predicate::str::contains("KSEI archives"));
+
+    // What an archive does hold is still readable.
+    let ticker =
+        run_success_json(bin_with_root(&root).args(["-o", "json", "ownership", "ticker", "AADI"]));
+    assert_eq!(ticker["holders"].as_array().map(Vec::len), Some(18));
+    let changes = run_success_json(bin_with_root(&root).args([
+        "-o",
+        "json",
+        "ownership",
+        "changes",
+        "--from",
+        "2026-01-30",
+        "--to",
+        "2026-02-27",
+    ]));
+    assert!(changes.as_array().is_some_and(|rows| !rows.is_empty()));
+}
