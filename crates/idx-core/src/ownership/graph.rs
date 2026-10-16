@@ -169,20 +169,7 @@ fn detect_root_node(conn: &Connection, root: &str) -> Result<String, IdxError> {
         return Ok(format!("ticker:{code}"));
     }
 
-    let q = format!("%{root}%");
-    let maybe_entity_id = conn
-        .query_row(
-            "SELECT id
-             FROM entities
-             WHERE canonical_name LIKE ?1 COLLATE NOCASE
-             ORDER BY LENGTH(canonical_name) ASC, canonical_name ASC
-             LIMIT 1",
-            params![q],
-            |row| row.get::<_, i64>(0),
-        )
-        .ok();
-
-    if let Some(entity_id) = maybe_entity_id {
+    if let Some(entity_id) = crate::ownership::db::find_entity_id_by_name(conn, root)? {
         return Ok(format!("entity:{entity_id}"));
     }
 
@@ -472,6 +459,25 @@ mod tests {
     fn dot_labels_escape_backslashes_quotes_and_newlines() {
         assert_eq!(super::escape_dot(r#"A "B" C\"#), r#"A \"B\" C\\"#);
         assert_eq!(super::escape_dot("LINE\nTWO"), r"LINE\nTWO");
+    }
+
+    #[test]
+    fn graph_root_lookup_skips_aggregate_entities() {
+        let conn = setup();
+        crate::ownership::entities::resolve_entity(
+            &conn,
+            "KSEI AGGREGATE LOCAL CP",
+            crate::ownership::types::OwnershipSource::Ksei,
+        )
+        .unwrap();
+
+        for root in ["aggregate", "KSEI AGGREGATE LOCAL CP", "%"] {
+            let err = query_ownership_graph(&conn, root, 1).unwrap_err();
+            assert!(
+                err.to_string().contains("graph root not found"),
+                "{root}: {err}"
+            );
+        }
     }
 
     #[test]

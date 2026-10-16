@@ -8,9 +8,10 @@ use rusqlite::{Connection, params};
 use crate::config::get_config_value;
 use crate::error::IdxError;
 use crate::ownership::types::{
-    BingHolding, ChangeRow, ChangeType, ConcentrationMetrics, CrossHolderRow, Entity,
-    EntityHoldings, EntityTickerRow, FlowSignal, HolderRow, InstitutionalFlow, KseiHolding,
-    Locality, OwnershipRelease, OwnershipSource, Ticker, TickerOwnership, UnresolvedRow,
+    AGGREGATE_HOLDER_PREFIX, BingHolding, ChangeRow, ChangeType, ConcentrationMetrics,
+    CrossHolderRow, Entity, EntityHoldings, EntityTickerRow, FlowSignal, HolderRow,
+    InstitutionalFlow, KseiHolding, Locality, OwnershipRelease, OwnershipSource, Ticker,
+    TickerOwnership, UnresolvedRow, is_aggregate_holder,
 };
 
 /// Ownership schema version 1 DDL.
@@ -1089,6 +1090,53 @@ pub fn list_unresolved(conn: &Connection, limit: usize) -> Result<Vec<Unresolved
     Ok(out)
 }
 
+/// SQL that is true when `column` does NOT hold a synthetic aggregate holder
+/// name (see [`AGGREGATE_HOLDER_PREFIX`]). GLOB, not LIKE: LIKE ignores ASCII
+/// case, so `ksei aggregate ...` would match. `column` must be NOT NULL.
+pub(crate) fn sql_not_aggregate(column: &str) -> String {
+    format!("NOT ({column} GLOB '{AGGREGATE_HOLDER_PREFIX}*')")
+}
+
+/// Id of the entity whose canonical name best matches `name`: the shortest
+/// name containing it, case-insensitive, `%` and `_` taken literally.
+/// Aggregate pseudo-holders never match, also in databases that already hold
+/// entities created for them by older imports.
+pub(crate) fn find_entity_id_by_name(
+    conn: &Connection,
+    name: &str,
+) -> Result<Option<i64>, IdxError> {
+    let sql = format!(
+        "SELECT id FROM entities
+         WHERE canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE AND {}
+         ORDER BY LENGTH(canonical_name) ASC, canonical_name ASC
+         LIMIT 1",
+        sql_not_aggregate("canonical_name")
+    );
+    let pattern = crate::ownership::search::like_pattern(name.trim());
+    match conn.query_row(&sql, params![pattern], |row| row.get(0)) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(IdxError::DatabaseError(e.to_string())),
+    }
+}
+
+/// Upper-cased with whitespace collapsed: how a typed alias is compared with
+/// the aggregate prefix.
+fn collapse_upper(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase()
+}
+
+fn reject_aggregate_target() -> IdxError {
+    IdxError::InvalidInput(
+        "KSEI AGGREGATE rows are investor-type totals from a KSEI archive, not holders; \
+         they cannot be mapped or merged"
+            .to_string(),
+    )
+}
+
 /// Manually map a raw investor name to a canonical entity.
 /// Creates the entity if it does not exist, then creates/updates aliases and unresolved holdings.
 pub fn manual_map(conn: &Connection, raw_name: &str, canonical_name: &str) -> Result<(), IdxError> {
@@ -1099,6 +1147,11 @@ pub fn manual_map(conn: &Connection, raw_name: &str, canonical_name: &str) -> Re
         return Err(IdxError::ParseError(
             "alias and canonical entity must be non-empty".to_string(),
         ));
+    }
+    if is_aggregate_holder(&collapse_upper(raw_name))
+        || is_aggregate_holder(&collapse_upper(canonical_name))
+    {
+        return Err(reject_aggregate_target());
     }
 
     conn.execute("BEGIN IMMEDIATE", [])
@@ -1196,6 +1249,18 @@ pub fn merge_entities(conn: &Connection, keep_id: i64, merge_id: i64) -> Result<
             return Err(IdxError::ParseError(format!(
                 "entity not found: keep_id={keep_id}, merge_id={merge_id}"
             )));
+        }
+        for id in [keep_id, merge_id] {
+            let name: String = conn
+                .query_row(
+                    "SELECT canonical_name FROM entities WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
+            if is_aggregate_holder(&name) {
+                return Err(reject_aggregate_target());
+            }
         }
 
         conn.execute(
@@ -1407,14 +1472,17 @@ mod tests {
     use chrono::NaiveDate;
     use rusqlite::{Connection, params};
 
+    use crate::error::IdxError;
     use crate::ownership::db::{
-        compute_concentration, ensure_schema, get_ticker_id, insert_bing_holdings,
-        insert_ksei_holdings, insert_release, query_changes, query_concentration,
-        query_cross_holders, query_ticker_holdings, release_exists, upsert_ticker,
-        write_ksei_release,
+        compute_concentration, ensure_schema, find_entity_id_by_name, get_ticker_id,
+        insert_bing_holdings, insert_ksei_holdings, insert_release, manual_map, merge_entities,
+        query_changes, query_concentration, query_cross_holders, query_ticker_holdings,
+        release_exists, sql_not_aggregate, upsert_ticker, write_ksei_release,
     };
+    use crate::ownership::entities::resolve_entity;
     use crate::ownership::types::{
-        BingHolding, FlowSignal, KseiHolding, Locality, OwnershipRelease,
+        BingHolding, FlowSignal, KseiHolding, Locality, OwnershipRelease, OwnershipSource,
+        is_aggregate_holder,
     };
 
     fn setup() -> Connection {
@@ -2143,5 +2211,81 @@ mod tests {
             real_dir.join("ownership.db")
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_sql_aggregate_predicate_matches_rust_definition() {
+        let conn = setup();
+        let predicate = sql_not_aggregate("n");
+        for name in [
+            "KSEI AGGREGATE LOCAL CP",
+            "KSEI AGGREGATE FOREIGN MF",
+            "ksei aggregate local cp",
+            "KSEI AGGREGATE",
+            "KSEI AGGREGATES",
+            " KSEI AGGREGATE LOCAL CP",
+            "PT BANK CENTRAL ASIA TBK",
+        ] {
+            let real: bool = conn
+                .query_row(
+                    &format!("SELECT {predicate} FROM (SELECT ?1 AS n)"),
+                    params![name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(real, !is_aggregate_holder(name), "{name}");
+        }
+    }
+
+    /// Entities an older archive import left behind (one per bucket name).
+    fn legacy_aggregate_entity(conn: &Connection, name: &str) -> i64 {
+        resolve_entity(conn, name, OwnershipSource::Ksei).unwrap()
+    }
+
+    #[test]
+    fn test_entity_lookup_skips_aggregates_and_takes_wildcards_literally() {
+        let conn = setup();
+        legacy_aggregate_entity(&conn, "KSEI AGGREGATE LOCAL CP");
+        let coop = resolve_entity(&conn, "LOCAL COOPERATIVE", OwnershipSource::Ksei).unwrap();
+
+        assert_eq!(find_entity_id_by_name(&conn, "local").unwrap(), Some(coop));
+        assert_eq!(find_entity_id_by_name(&conn, "aggregate").unwrap(), None);
+        assert_eq!(
+            find_entity_id_by_name(&conn, "ksei aggregate local cp").unwrap(),
+            None
+        );
+        assert_eq!(find_entity_id_by_name(&conn, "%").unwrap(), None);
+        assert_eq!(find_entity_id_by_name(&conn, "_").unwrap(), None);
+    }
+
+    #[test]
+    fn test_map_and_merge_reject_aggregate_entities() {
+        let conn = setup();
+        let aggregate = legacy_aggregate_entity(&conn, "KSEI AGGREGATE LOCAL CP");
+        let real = resolve_entity(&conn, "PT REAL HOLDER", OwnershipSource::Ksei).unwrap();
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        let before = (count("entities"), count("entity_aliases"));
+
+        for (alias, target) in [
+            ("KSEI AGGREGATE LOCAL CP", "SOME INVESTOR"),
+            ("  ksei   aggregate foreign mf ", "SOME INVESTOR"),
+            ("SOME ALIAS", "KSEI AGGREGATE LOCAL CP"),
+        ] {
+            let err = manual_map(&conn, alias, target).unwrap_err();
+            assert!(matches!(err, IdxError::InvalidInput(_)), "{alias}: {err:?}");
+        }
+        for (keep, merge) in [(real, aggregate), (aggregate, real)] {
+            let err = merge_entities(&conn, keep, merge).unwrap_err();
+            assert!(matches!(err, IdxError::InvalidInput(_)), "{err:?}");
+        }
+
+        assert_eq!((count("entities"), count("entity_aliases")), before);
+        // Ordinary mapping still works.
+        manual_map(&conn, "PT REAL HOLDER LTD", "PT REAL HOLDER").unwrap();
     }
 }

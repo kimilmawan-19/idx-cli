@@ -135,14 +135,8 @@ impl Investor {
     /// canonical name containing it).
     pub fn entity(&self, name: &str) -> Result<EntityHoldings, IdxError> {
         let conn = self.connect()?;
-        let pattern = search::like_pattern(name.trim());
-        let entity_id = conn
-            .query_row(
-                "SELECT id FROM entities WHERE canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE ORDER BY LENGTH(canonical_name) ASC LIMIT 1",
-                rusqlite::params![pattern],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|_| IdxError::ParseError(format!("entity not found: {name}")))?;
+        let entity_id = db::find_entity_id_by_name(&conn, name)?
+            .ok_or_else(|| IdxError::ParseError(format!("entity not found: {name}")))?;
         db::query_entity_holdings(&conn, entity_id)
     }
 
