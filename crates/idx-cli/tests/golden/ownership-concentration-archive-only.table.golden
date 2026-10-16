@@ -1,0 +1,4 @@
+exit: 3
+--- stdout
+--- stderr
+Error: no market data: no holder register in the ownership database (it only has KSEI archives, which hold investor-type totals, not holders); sync the snapshot or import an above-1% report

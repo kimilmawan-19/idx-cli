@@ -1,0 +1,4 @@
+exit: 2
+--- stdout
+--- stderr
+{"code":"INVALIDINPUT","error":true,"message":"invalid input: cannot compare 2026-02-27 (KSEI archive) with 2026-08-31 (holder register): KSEI archives only total holdings per investor type and locality, so they cannot be diffed against a holder register. Holder register dates: 2026-08-31. KSEI archive dates: 2026-02-27, 2026-01-30."}

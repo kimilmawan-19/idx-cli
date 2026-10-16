@@ -310,6 +310,31 @@ args = ["ownership", "import", "--file", "tests/fixtures/ksei_above1_20260831_ex
 name = "ownership-import-archive-txt"
 args = ["ownership", "import", "--file", "tests/fixtures/ksei_balancepos_20260227_excerpt.txt"]
 
+# A KSEI archive is a total per investor type, not a list of holders. These
+# pin how the commands treat one that sits next to, or without, a register.
+[[case]]
+name = "ownership-ticker-archive-only"
+formats = ["json"]
+args = ["ownership", "ticker", "AADI", "--source", "ksei"]
+before = [["ownership", "import", "--file", "tests/fixtures/ksei_balancepos_20260227_excerpt.txt"]]
+
+[[case]]
+name = "ownership-ticker-newer-archive"
+formats = ["json"]
+args = ["ownership", "ticker", "AADI", "--source", "ksei"]
+ownership = true
+before = [["ownership", "import", "--file", "tests/fixtures/ksei_balancepos_20261030_excerpt.txt"]]
+
+[[case]]
+name = "ownership-concentration-archive-only"
+args = ["ownership", "concentration"]
+before = [["ownership", "import", "--file", "tests/fixtures/ksei_balancepos_20260227_excerpt.txt"]]
+
+[[case]]
+name = "ownership-changes-mixed-kinds"
+args = ["ownership", "changes", "--from", "2026-02-27", "--to", "2026-08-31"]
+ownership = true
+
 [[case]]
 name = "ownership-releases"
 args = ["ownership", "releases"]
