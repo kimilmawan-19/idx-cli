@@ -2719,3 +2719,164 @@ fn ownership_changes_compare_releases_of_one_kind() {
         ))
         .stderr(predicate::str::contains("INVALIDINPUT"));
 }
+
+#[test]
+fn ownership_archive_import_creates_no_entities() {
+    let root = test_env_dir("archive-import-no-entities");
+    let db_path = root.join("ownership.db");
+    run_success_stdout(bin_with_root(&root).args([
+        "config",
+        "set",
+        "ownership.db_path",
+        db_path.to_str().unwrap(),
+    ]));
+    import_archive_text(
+        &root,
+        "Balancepos20260227.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt"),
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+    assert_eq!(count("SELECT COUNT(*) FROM ksei_holdings"), 18);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM ksei_holdings WHERE entity_id IS NOT NULL"),
+        0
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM entities"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM entity_aliases"), 0);
+
+    let unresolved = run_success_json(bin_with_root(&root).args([
+        "-o",
+        "json",
+        "ownership",
+        "resolve",
+        "unresolved",
+    ]));
+    assert_eq!(unresolved, serde_json::json!([]));
+}
+
+#[test]
+fn ownership_legacy_aggregate_entities_are_hidden() {
+    let root = test_env_dir("legacy-aggregate-entities");
+    prepare_snapshot_fixture(&root);
+    let db_path = root.join("published-ownership.db");
+    let feb = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt");
+    import_archive_text(
+        &root,
+        "Balancepos20260130.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt"),
+    );
+    import_archive_text(&root, "Balancepos20260227.txt", feb);
+
+    let observe = |root: &Path| {
+        let mut outputs = entity_level_outputs(root);
+        for args in [
+            vec!["-o", "json", "ownership", "search", "aggregate"],
+            vec!["-o", "json", "ownership", "resolve", "unresolved"],
+            vec![
+                "-o",
+                "json",
+                "ownership",
+                "changes",
+                "--from",
+                "2026-01-30",
+                "--to",
+                "2026-02-27",
+            ],
+            vec![
+                "-o",
+                "json",
+                "ownership",
+                "ticker",
+                "AADI",
+                "--source",
+                "ksei",
+            ],
+        ] {
+            outputs.push(run_success_stdout(bin_with_root(root).args(args)));
+        }
+        outputs
+    };
+    let before = observe(&root);
+    assert_eq!(before[5].trim(), "[]", "search aggregate: {}", before[5]);
+
+    // What an older import left behind: an entity and an alias per bucket
+    // name, and the holdings linked to them.
+    let counts = |sql: &str| -> i64 {
+        Connection::open(&db_path)
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    };
+    Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO entities (canonical_name, created_at, updated_at)
+               SELECT DISTINCT raw_investor_name, 0, 0 FROM ksei_holdings
+               WHERE raw_investor_name GLOB 'KSEI AGGREGATE *';
+             INSERT INTO entity_aliases (entity_id, raw_name, source, confidence, method)
+               SELECT id, canonical_name, 'ksei', 1.0, 'exact' FROM entities
+               WHERE canonical_name GLOB 'KSEI AGGREGATE *';
+             UPDATE ksei_holdings
+               SET entity_id = (SELECT entity_id FROM entity_aliases a
+                                WHERE a.raw_name = ksei_holdings.raw_investor_name)
+               WHERE raw_investor_name GLOB 'KSEI AGGREGATE *';",
+        )
+        .unwrap();
+    assert_eq!(
+        counts("SELECT COUNT(*) FROM entities WHERE canonical_name GLOB 'KSEI AGGREGATE *'"),
+        18
+    );
+    assert_eq!(observe(&root), before);
+
+    // They cannot be looked up, mapped or merged.
+    bin_with_root(&root)
+        .args([
+            "-o",
+            "json",
+            "ownership",
+            "entity",
+            "KSEI AGGREGATE LOCAL CP",
+        ])
+        .assert()
+        .failure()
+        .stdout("");
+    for args in [
+        vec!["resolve", "map", "KSEI AGGREGATE LOCAL CP", "SOME INVESTOR"],
+        vec!["resolve", "map", "SOME ALIAS", "KSEI AGGREGATE LOCAL CP"],
+        vec!["resolve", "merge", "1", "2"],
+    ] {
+        let mut full = vec!["-o", "json", "ownership"];
+        full.extend(args);
+        bin_with_root(&root)
+            .args(full)
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(predicate::str::contains("INVALIDINPUT"));
+    }
+    assert_eq!(counts("SELECT COUNT(*) FROM entities"), 19);
+    assert_eq!(observe(&root), before);
+
+    // Re-importing a month with --force drops its links to those entities;
+    // the January month keeps its own, and the two still line up.
+    let linked = |date: &str| {
+        counts(&format!(
+            "SELECT COUNT(*) FROM ksei_holdings
+             WHERE report_date = '{date}' AND entity_id IS NOT NULL
+               AND raw_investor_name GLOB 'KSEI AGGREGATE *'"
+        ))
+    };
+    assert_eq!((linked("2026-01-30"), linked("2026-02-27")), (18, 18));
+    let feb_path = root.join("Balancepos20260227.txt");
+    run_success_stdout(bin_with_root(&root).args([
+        "ownership",
+        "import",
+        "--file",
+        feb_path.to_str().unwrap(),
+        "--force",
+    ]));
+    assert_eq!((linked("2026-01-30"), linked("2026-02-27")), (18, 0));
+    assert_eq!(observe(&root), before);
+}

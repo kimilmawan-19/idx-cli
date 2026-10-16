@@ -19,7 +19,7 @@ use crate::ownership::snapshot::{self, OwnershipSyncResult};
 use crate::ownership::types::{
     ChangeRow, ConcentrationMetrics, CrossHolderRow, Entity, EntityHoldings, GraphEdge, GraphNode,
     InstitutionalFlow, KseiHolding, OwnershipRelease, OwnershipSource, TickerOwnership,
-    UnresolvedRow,
+    UnresolvedRow, is_aggregate_holder,
 };
 use crate::ownership::{archive, db, entities, graph, parser, search, xlsx};
 
@@ -321,16 +321,22 @@ impl Investor {
             for draft in drafts {
                 let ticker_id =
                     db::upsert_ticker(&conn, &draft.ticker_code, draft.issuer_name.as_deref())?;
-                let entity_id = entities::resolve_entity(
-                    &conn,
-                    &draft.raw_investor_name,
-                    OwnershipSource::Ksei,
-                )?;
+                // Archive totals per investor type are not investors: no
+                // entity or alias, so nothing can mistake them for one.
+                let entity_id = if is_aggregate_holder(&draft.raw_investor_name) {
+                    None
+                } else {
+                    Some(entities::resolve_entity(
+                        &conn,
+                        &draft.raw_investor_name,
+                        OwnershipSource::Ksei,
+                    )?)
+                };
                 ticker_ids.insert(ticker_id);
                 holdings.push(KseiHolding {
                     id: 0,
                     ticker_id,
-                    entity_id: Some(entity_id),
+                    entity_id,
                     raw_investor_name: draft.raw_investor_name,
                     investor_type: draft.investor_type,
                     locality: draft.locality,

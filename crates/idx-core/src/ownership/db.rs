@@ -1169,8 +1169,9 @@ pub fn list_unresolved(conn: &Connection, limit: usize) -> Result<Vec<Unresolved
     let limit_i64 =
         i64::try_from(limit).map_err(|e| IdxError::DatabaseError(format!("invalid limit: {e}")))?;
 
+    // Aggregate totals have no entity by design; they are not names to resolve.
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT DISTINCT
                 h.raw_name,
                 h.source,
@@ -1187,10 +1188,12 @@ pub fn list_unresolved(conn: &Connection, limit: usize) -> Result<Vec<Unresolved
              JOIN tickers t ON t.id = h.ticker_id
              LEFT JOIN entity_aliases a ON a.raw_name = h.raw_name AND a.source = h.source
              LEFT JOIN entities e ON e.id = COALESCE(a.entity_id, h.entity_id)
-             WHERE h.entity_id IS NULL OR a.entity_id IS NULL OR COALESCE(a.confidence, 0.0) < 0.8
+             WHERE (h.entity_id IS NULL OR a.entity_id IS NULL OR COALESCE(a.confidence, 0.0) < 0.8)
+               AND {not_aggregate}
              ORDER BY COALESCE(a.confidence, 0.0) ASC, h.raw_name ASC
              LIMIT ?1",
-        )
+            not_aggregate = sql_not_aggregate("h.raw_name"),
+        ))
         .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
     let rows = stmt
@@ -2920,5 +2923,33 @@ mod tests {
         let changes = query_changes(&conn, "2026-01-01", "2026-02-27").unwrap();
         assert_eq!(changes.len(), 1, "{changes:?}");
         assert_eq!((changes[0].old_bps, changes[0].new_bps), (None, Some(4000)));
+    }
+
+    #[test]
+    fn unresolved_list_ignores_aggregate_rows() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        // Archive totals have no entity; a register holder can lack one too.
+        release_with(
+            &conn,
+            "archive",
+            date(8, 31),
+            1,
+            &[
+                (aa, None, "KSEI AGGREGATE LOCAL CP", 6000),
+                (aa, None, "KSEI AGGREGATE FOREIGN MF", 3000),
+            ],
+        );
+        release_with(
+            &conn,
+            "register",
+            date(9, 30),
+            2,
+            &[(aa, None, "PT UNMATCHED HOLDER", 2000)],
+        );
+
+        let rows = super::list_unresolved(&conn, 50).unwrap();
+        let names: Vec<_> = rows.iter().map(|row| row.raw_name.as_str()).collect();
+        assert_eq!(names, vec!["PT UNMATCHED HOLDER"]);
     }
 }
