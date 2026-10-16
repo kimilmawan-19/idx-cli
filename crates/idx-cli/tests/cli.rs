@@ -2658,3 +2658,64 @@ fn ownership_ticker_on_an_archive_only_database_says_what_it_shows() {
         .success()
         .stderr("");
 }
+
+#[test]
+fn ownership_changes_compare_releases_of_one_kind() {
+    let root = test_env_dir("changes-one-kind");
+    prepare_snapshot_fixture(&root);
+    let changes = |root: &Path, from: &str, to: &str| {
+        run_success_json(bin_with_root(root).args([
+            "-o",
+            "json",
+            "ownership",
+            "changes",
+            "--from",
+            from,
+            "--to",
+            to,
+        ]))
+    };
+    let registers_before = changes(&root, "2026-01-31", "2026-02-27");
+    assert!(!registers_before.as_array().unwrap().is_empty());
+
+    // An archive for the register's own date, imported later, used to win.
+    import_archive_text(
+        &root,
+        "Balancepos20260130.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt"),
+    );
+    import_archive_text(
+        &root,
+        "Balancepos20260227.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt"),
+    );
+    assert_eq!(changes(&root, "2026-01-31", "2026-02-27"), registers_before);
+
+    let archives = changes(&root, "2026-01-30", "2026-02-27");
+    let archives = archives.as_array().unwrap();
+    assert!(!archives.is_empty());
+    assert!(archives.iter().all(|row| {
+        row["entity_name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("KSEI AGGREGATE "))
+    }));
+
+    bin_with_root(&root)
+        .args([
+            "-o",
+            "json",
+            "ownership",
+            "changes",
+            "--from",
+            "2026-01-31",
+            "--to",
+            "2026-01-30",
+        ])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "cannot compare 2026-01-31 (holder register) with 2026-01-30 (KSEI archive)",
+        ))
+        .stderr(predicate::str::contains("INVALIDINPUT"));
+}
