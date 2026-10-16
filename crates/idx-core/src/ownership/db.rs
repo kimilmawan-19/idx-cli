@@ -8,9 +8,10 @@ use rusqlite::{Connection, params};
 use crate::config::get_config_value;
 use crate::error::IdxError;
 use crate::ownership::types::{
-    BingHolding, ChangeRow, ChangeType, ConcentrationMetrics, CrossHolderRow, Entity,
-    EntityHoldings, EntityTickerRow, FlowSignal, HolderRow, InstitutionalFlow, KseiHolding,
-    Locality, OwnershipRelease, OwnershipSource, Ticker, TickerOwnership, UnresolvedRow,
+    AGGREGATE_HOLDER_PREFIX, BingHolding, ChangeRow, ChangeType, ConcentrationMetrics,
+    CrossHolderRow, Entity, EntityHoldings, EntityTickerRow, FlowSignal, HolderRow,
+    InstitutionalFlow, KseiHolding, Locality, OwnershipRelease, OwnershipSource, Ticker,
+    TickerOwnership, UnresolvedRow, is_aggregate_holder,
 };
 
 /// Ownership schema version 1 DDL.
@@ -404,8 +405,12 @@ pub fn query_ticker_holdings(conn: &Connection, code: &str) -> Result<TickerOwne
     let ticker =
         query_ticker(conn, code)?.ok_or_else(|| IdxError::SymbolNotFound(code.to_string()))?;
 
-    let latest_ksei = latest_ksei_release(conn)?;
-    let ksei_as_of = latest_ksei.as_ref().map(|release| release.as_of_date);
+    let picked = ticker_release(conn)?;
+    let ksei_as_of = picked.as_ref().map(|picked| picked.release.as_of_date);
+    let ksei_aggregate = picked.as_ref().is_some_and(|picked| picked.aggregate);
+    let newer_aggregate_as_of = picked
+        .as_ref()
+        .and_then(|picked| picked.newer_aggregate_as_of);
 
     let bing_as_of = conn
         .query_row(
@@ -417,20 +422,26 @@ pub fn query_ticker_holdings(conn: &Connection, code: &str) -> Result<TickerOwne
 
     let mut holders: Vec<HolderRow> = Vec::new();
 
-    if let Some(latest_ksei) = latest_ksei.as_ref() {
+    if let Some(picked) = picked.as_ref() {
+        // Aggregate rows are named and keyed by their own text, whether or not
+        // an older import linked them to an entity: the output is the same for
+        // those databases and for new ones.
+        let aggregate = sql_is_aggregate("k.raw_investor_name");
         let mut stmt = conn
-            .prepare(
-                "SELECT k.entity_id, COALESCE(e.canonical_name, k.raw_investor_name),
+            .prepare(&format!(
+                "SELECT CASE WHEN {aggregate} THEN NULL ELSE k.entity_id END,
+                        CASE WHEN {aggregate} THEN k.raw_investor_name
+                             ELSE COALESCE(e.canonical_name, k.raw_investor_name) END,
                         k.investor_type, k.locality, k.total_shares, k.percentage_bps
                  FROM ksei_holdings k
                  LEFT JOIN entities e ON e.id = k.entity_id
                  WHERE k.ticker_id = ?1 AND k.release_sha256 = ?2
-                 ORDER BY k.percentage_bps DESC, k.total_shares DESC",
-            )
+                 ORDER BY k.percentage_bps DESC, k.total_shares DESC"
+            ))
             .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
         let rows = stmt
-            .query_map(params![ticker.id, &latest_ksei.sha256], |row| {
+            .query_map(params![ticker.id, &picked.release.sha256], |row| {
                 Ok((
                     row.get::<_, Option<i64>>(0)?,
                     row.get::<_, String>(1)?,
@@ -518,6 +529,8 @@ pub fn query_ticker_holdings(conn: &Connection, code: &str) -> Result<TickerOwne
         ticker,
         ksei_as_of,
         bing_as_of,
+        ksei_aggregate,
+        newer_aggregate_as_of,
         holders,
         concentration,
         flow,
@@ -534,7 +547,7 @@ pub fn query_entity_holdings(
 
     let mut holdings = Vec::new();
 
-    if let Some(latest_ksei) = latest_ksei_release(conn)? {
+    if let Some(latest_ksei) = latest_holder_release(conn)? {
         let mut stmt = conn
             .prepare(
                 "SELECT t.id, t.code, t.name, t.sector, k.total_shares, k.percentage_bps, k.report_date
@@ -639,7 +652,7 @@ pub fn query_cross_holders(
         (Entity, std::collections::BTreeSet<i64>, i64),
     > = std::collections::BTreeMap::new();
 
-    if let Some(latest_ksei) = latest_ksei_release(conn)? {
+    if let Some(latest_ksei) = latest_holder_release(conn)? {
         let mut stmt = conn
             .prepare(
                 "SELECT e.id, e.canonical_name, e.entity_type, e.country, k.ticker_id, k.percentage_bps
@@ -755,7 +768,7 @@ pub fn query_concentration(
         )));
     }
 
-    let Some(latest_ksei) = latest_ksei_release(conn)? else {
+    let Some(latest_ksei) = latest_holder_release(conn)? else {
         return Ok(Vec::new());
     };
 
@@ -919,6 +932,134 @@ pub fn query_bing_flow(
     }))
 }
 
+/// The releases that have rows for one report date, one per kind. Several
+/// releases can share a date (a re-issued file, an archive next to the
+/// register); within a kind the newest import wins.
+struct DateReleases {
+    register: Option<String>,
+    aggregate: Option<String>,
+}
+
+fn releases_for_date(conn: &Connection, date: &str) -> Result<DateReleases, IdxError> {
+    let db_err = |e: rusqlite::Error| IdxError::DatabaseError(e.to_string());
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.sha256
+             FROM ownership_releases r
+             WHERE EXISTS (
+                 SELECT 1 FROM ksei_holdings k
+                 WHERE k.release_sha256 = r.sha256 AND k.report_date = ?1
+             )
+             ORDER BY r.imported_at DESC, r.id DESC",
+        )
+        .map_err(db_err)?;
+    let shas = stmt
+        .query_map(params![date], |row| row.get::<_, String>(0))
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let mut found = DateReleases {
+        register: None,
+        aggregate: None,
+    };
+    for sha256 in shas {
+        match release_kind(conn, &sha256)? {
+            Some(ReleaseKind::Register) => {
+                found.register.get_or_insert(sha256);
+            }
+            Some(ReleaseKind::Aggregate) => {
+                found.aggregate.get_or_insert(sha256);
+            }
+            None => {}
+        }
+    }
+    Ok(found)
+}
+
+/// As-of dates of the registers and of the archives, each newest first, for
+/// messages (`releases` does not show a release's kind).
+fn release_dates_by_kind(conn: &Connection) -> Result<(Vec<String>, Vec<String>), IdxError> {
+    let db_err = |e: rusqlite::Error| IdxError::DatabaseError(e.to_string());
+    let mut stmt = conn
+        .prepare(
+            "SELECT sha256, as_of_date
+             FROM ownership_releases
+             ORDER BY as_of_date DESC, imported_at DESC, id DESC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(db_err)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(db_err)?;
+
+    let (mut registers, mut archives) = (Vec::new(), Vec::new());
+    for (sha256, as_of_date) in rows {
+        let list = match release_kind(conn, &sha256)? {
+            Some(ReleaseKind::Register) => &mut registers,
+            Some(ReleaseKind::Aggregate) => &mut archives,
+            None => continue,
+        };
+        if !list.contains(&as_of_date) {
+            list.push(as_of_date);
+        }
+    }
+    Ok((registers, archives))
+}
+
+/// The two releases to diff. Registers are compared with registers and
+/// archives with archives: an archive has no named holders, so against a
+/// register every holder would read as new or exited. A date with no release
+/// at all compares as empty, as it always did.
+fn pair_change_releases(
+    conn: &Connection,
+    from_date: &str,
+    to_date: &str,
+) -> Result<(String, String), IdxError> {
+    let from = releases_for_date(conn, from_date)?;
+    let to = releases_for_date(conn, to_date)?;
+
+    if let (Some(a), Some(b)) = (&from.register, &to.register) {
+        return Ok((a.clone(), b.clone()));
+    }
+    if let (Some(a), Some(b)) = (&from.aggregate, &to.aggregate) {
+        return Ok((a.clone(), b.clone()));
+    }
+    let any = |d: &DateReleases| d.register.clone().or_else(|| d.aggregate.clone());
+    let (from_any, to_any) = (any(&from), any(&to));
+    if from_any.is_none() || to_any.is_none() {
+        return Ok((from_any.unwrap_or_default(), to_any.unwrap_or_default()));
+    }
+
+    let kind = |d: &DateReleases| {
+        if d.register.is_some() {
+            "holder register"
+        } else {
+            "KSEI archive"
+        }
+    };
+    let (registers, archives) = release_dates_by_kind(conn)?;
+    let list = |dates: &[String]| {
+        if dates.is_empty() {
+            "none".to_string()
+        } else {
+            dates.join(", ")
+        }
+    };
+    Err(IdxError::InvalidInput(format!(
+        "cannot compare {from_date} ({}) with {to_date} ({}): KSEI archives only total holdings \
+         per investor type and locality, so they cannot be diffed against a holder register. \
+         Holder register dates: {}. KSEI archive dates: {}.",
+        kind(&from),
+        kind(&to),
+        list(&registers),
+        list(&archives),
+    )))
+}
+
 /// Compare two KSEI snapshots by date and return ownership changes.
 /// Finds: new holders, exited holders, percentage increases/decreases.
 pub fn query_changes(
@@ -926,85 +1067,67 @@ pub fn query_changes(
     from_date: &str,
     to_date: &str,
 ) -> Result<Vec<ChangeRow>, IdxError> {
-    let mut stmt = conn
-        .prepare(
-            "WITH
-                -- One release per date (the latest import, as for every other
-                -- query), and one row per holder: several raw names can
-                -- resolve to one entity, which multiplied the join below.
-                from_release AS (
-                    SELECT k.release_sha256 AS sha256
-                    FROM ksei_holdings k
-                    JOIN ownership_releases r ON r.sha256 = k.release_sha256
-                    WHERE k.report_date = ?1
-                    ORDER BY r.imported_at DESC
-                    LIMIT 1
-                ),
-                from_snapshot AS (
-                    SELECT
-                        t.code AS ticker_code,
-                        MIN(COALESCE(e.canonical_name, k.raw_investor_name)) AS entity_name,
-                        CASE
-                            WHEN k.entity_id IS NOT NULL THEN 'id:' || k.entity_id
-                            ELSE 'raw:' || UPPER(TRIM(k.raw_investor_name))
-                        END AS holder_key,
-                        SUM(k.percentage_bps) AS old_bps
-                    FROM ksei_holdings k
-                    JOIN from_release rel ON rel.sha256 = k.release_sha256
-                    JOIN tickers t ON t.id = k.ticker_id
-                    LEFT JOIN entities e ON e.id = k.entity_id
-                    WHERE k.report_date = ?1
-                    GROUP BY t.code, holder_key
-                ),
-                to_release AS (
-                    SELECT k.release_sha256 AS sha256
-                    FROM ksei_holdings k
-                    JOIN ownership_releases r ON r.sha256 = k.release_sha256
-                    WHERE k.report_date = ?2
-                    ORDER BY r.imported_at DESC
-                    LIMIT 1
-                ),
-                to_snapshot AS (
-                    SELECT
-                        t.code AS ticker_code,
-                        MIN(COALESCE(e.canonical_name, k.raw_investor_name)) AS entity_name,
-                        CASE
-                            WHEN k.entity_id IS NOT NULL THEN 'id:' || k.entity_id
-                            ELSE 'raw:' || UPPER(TRIM(k.raw_investor_name))
-                        END AS holder_key,
-                        SUM(k.percentage_bps) AS new_bps
-                    FROM ksei_holdings k
-                    JOIN to_release rel ON rel.sha256 = k.release_sha256
-                    JOIN tickers t ON t.id = k.ticker_id
-                    LEFT JOIN entities e ON e.id = k.entity_id
-                    WHERE k.report_date = ?2
-                    GROUP BY t.code, holder_key
-                ),
-                keys AS (
-                    SELECT ticker_code, holder_key FROM from_snapshot
-                    UNION
-                    SELECT ticker_code, holder_key FROM to_snapshot
-                )
-             SELECT
-                k.ticker_code,
-                COALESCE(ts.entity_name, fs.entity_name) AS entity_name,
-                fs.old_bps,
-                ts.new_bps
-             FROM keys k
-             LEFT JOIN from_snapshot fs
-                    ON fs.ticker_code = k.ticker_code AND fs.holder_key = k.holder_key
-             LEFT JOIN to_snapshot ts
-                    ON ts.ticker_code = k.ticker_code AND ts.holder_key = k.holder_key
-             WHERE
-                (fs.old_bps IS NULL AND ts.new_bps IS NOT NULL)
-                OR (fs.old_bps IS NOT NULL AND ts.new_bps IS NULL)
-                OR (fs.old_bps IS NOT NULL AND ts.new_bps IS NOT NULL AND fs.old_bps <> ts.new_bps)
-             ORDER BY k.ticker_code ASC, ABS(COALESCE(ts.new_bps, 0) - COALESCE(fs.old_bps, 0)) DESC, entity_name ASC",
+    let (from_sha, to_sha) = pair_change_releases(conn, from_date, to_date)?;
+
+    // One row per holder: several raw names can resolve to one entity, which
+    // multiplied the join below. Aggregate rows are keyed and named by their
+    // own text, linked to an entity or not, so archives imported before and
+    // after entities stopped being created for them still line up.
+    let aggregate = sql_is_aggregate("k.raw_investor_name");
+    let snapshot = |sha: &str, date: &str, bps: &str| {
+        format!(
+            "SELECT
+                 t.code AS ticker_code,
+                 MIN(CASE WHEN {aggregate} THEN k.raw_investor_name
+                          ELSE COALESCE(e.canonical_name, k.raw_investor_name) END) AS entity_name,
+                 CASE
+                     WHEN {aggregate} THEN 'raw:' || UPPER(TRIM(k.raw_investor_name))
+                     WHEN k.entity_id IS NOT NULL THEN 'id:' || k.entity_id
+                     ELSE 'raw:' || UPPER(TRIM(k.raw_investor_name))
+                 END AS holder_key,
+                 SUM(k.percentage_bps) AS {bps}
+             FROM ksei_holdings k
+             JOIN tickers t ON t.id = k.ticker_id
+             LEFT JOIN entities e ON e.id = k.entity_id
+             WHERE k.release_sha256 = {sha} AND k.report_date = {date}
+             GROUP BY t.code, holder_key"
         )
+    };
+    let sql = format!(
+        "WITH
+            from_snapshot AS ({from_snapshot}),
+            to_snapshot AS ({to_snapshot}),
+            keys AS (
+                SELECT ticker_code, holder_key FROM from_snapshot
+                UNION
+                SELECT ticker_code, holder_key FROM to_snapshot
+            )
+         SELECT
+            k.ticker_code,
+            COALESCE(ts.entity_name, fs.entity_name) AS entity_name,
+            fs.old_bps,
+            ts.new_bps
+         FROM keys k
+         LEFT JOIN from_snapshot fs
+                ON fs.ticker_code = k.ticker_code AND fs.holder_key = k.holder_key
+         LEFT JOIN to_snapshot ts
+                ON ts.ticker_code = k.ticker_code AND ts.holder_key = k.holder_key
+         WHERE
+            (fs.old_bps IS NULL AND ts.new_bps IS NOT NULL)
+            OR (fs.old_bps IS NOT NULL AND ts.new_bps IS NULL)
+            OR (fs.old_bps IS NOT NULL AND ts.new_bps IS NOT NULL AND fs.old_bps <> ts.new_bps)
+         ORDER BY k.ticker_code ASC,
+                  ABS(COALESCE(ts.new_bps, 0) - COALESCE(fs.old_bps, 0)) DESC,
+                  entity_name ASC",
+        from_snapshot = snapshot("?3", "?1", "old_bps"),
+        to_snapshot = snapshot("?4", "?2", "new_bps"),
+    );
+    let mut stmt = conn
+        .prepare(&sql)
         .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
     let rows = stmt
-        .query_map(params![from_date, to_date], |row| {
+        .query_map(params![from_date, to_date, from_sha, to_sha], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1046,8 +1169,9 @@ pub fn list_unresolved(conn: &Connection, limit: usize) -> Result<Vec<Unresolved
     let limit_i64 =
         i64::try_from(limit).map_err(|e| IdxError::DatabaseError(format!("invalid limit: {e}")))?;
 
+    // Aggregate totals have no entity by design; they are not names to resolve.
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT DISTINCT
                 h.raw_name,
                 h.source,
@@ -1064,10 +1188,12 @@ pub fn list_unresolved(conn: &Connection, limit: usize) -> Result<Vec<Unresolved
              JOIN tickers t ON t.id = h.ticker_id
              LEFT JOIN entity_aliases a ON a.raw_name = h.raw_name AND a.source = h.source
              LEFT JOIN entities e ON e.id = COALESCE(a.entity_id, h.entity_id)
-             WHERE h.entity_id IS NULL OR a.entity_id IS NULL OR COALESCE(a.confidence, 0.0) < 0.8
+             WHERE (h.entity_id IS NULL OR a.entity_id IS NULL OR COALESCE(a.confidence, 0.0) < 0.8)
+               AND {not_aggregate}
              ORDER BY COALESCE(a.confidence, 0.0) ASC, h.raw_name ASC
              LIMIT ?1",
-        )
+            not_aggregate = sql_not_aggregate("h.raw_name"),
+        ))
         .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
     let rows = stmt
@@ -1089,6 +1215,58 @@ pub fn list_unresolved(conn: &Connection, limit: usize) -> Result<Vec<Unresolved
     Ok(out)
 }
 
+/// SQL that is true when `column` holds a synthetic aggregate holder name
+/// (see [`AGGREGATE_HOLDER_PREFIX`]). GLOB, not LIKE: LIKE ignores ASCII case,
+/// so `ksei aggregate ...` would match. `column` must be NOT NULL.
+pub(crate) fn sql_is_aggregate(column: &str) -> String {
+    format!("{column} GLOB '{AGGREGATE_HOLDER_PREFIX}*'")
+}
+
+/// The negation of [`sql_is_aggregate`].
+pub(crate) fn sql_not_aggregate(column: &str) -> String {
+    format!("NOT ({})", sql_is_aggregate(column))
+}
+
+/// Id of the entity whose canonical name best matches `name`: the shortest
+/// name containing it, case-insensitive, `%` and `_` taken literally.
+/// Aggregate pseudo-holders never match, also in databases that already hold
+/// entities created for them by older imports.
+pub(crate) fn find_entity_id_by_name(
+    conn: &Connection,
+    name: &str,
+) -> Result<Option<i64>, IdxError> {
+    let sql = format!(
+        "SELECT id FROM entities
+         WHERE canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE AND {}
+         ORDER BY LENGTH(canonical_name) ASC, canonical_name ASC
+         LIMIT 1",
+        sql_not_aggregate("canonical_name")
+    );
+    let pattern = crate::ownership::search::like_pattern(name.trim());
+    match conn.query_row(&sql, params![pattern], |row| row.get(0)) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(IdxError::DatabaseError(e.to_string())),
+    }
+}
+
+/// Upper-cased with whitespace collapsed: how a typed alias is compared with
+/// the aggregate prefix.
+fn collapse_upper(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_uppercase()
+}
+
+fn reject_aggregate_target() -> IdxError {
+    IdxError::InvalidInput(
+        "KSEI AGGREGATE rows are investor-type totals from a KSEI archive, not holders; \
+         they cannot be mapped or merged"
+            .to_string(),
+    )
+}
+
 /// Manually map a raw investor name to a canonical entity.
 /// Creates the entity if it does not exist, then creates/updates aliases and unresolved holdings.
 pub fn manual_map(conn: &Connection, raw_name: &str, canonical_name: &str) -> Result<(), IdxError> {
@@ -1099,6 +1277,11 @@ pub fn manual_map(conn: &Connection, raw_name: &str, canonical_name: &str) -> Re
         return Err(IdxError::ParseError(
             "alias and canonical entity must be non-empty".to_string(),
         ));
+    }
+    if is_aggregate_holder(&collapse_upper(raw_name))
+        || is_aggregate_holder(&collapse_upper(canonical_name))
+    {
+        return Err(reject_aggregate_target());
     }
 
     conn.execute("BEGIN IMMEDIATE", [])
@@ -1197,6 +1380,18 @@ pub fn merge_entities(conn: &Connection, keep_id: i64, merge_id: i64) -> Result<
                 "entity not found: keep_id={keep_id}, merge_id={merge_id}"
             )));
         }
+        for id in [keep_id, merge_id] {
+            let name: String = conn
+                .query_row(
+                    "SELECT canonical_name FROM entities WHERE id = ?1",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
+            if is_aggregate_holder(&name) {
+                return Err(reject_aggregate_target());
+            }
+        }
 
         conn.execute(
             "UPDATE entity_aliases SET entity_id = ?1 WHERE entity_id = ?2",
@@ -1293,32 +1488,150 @@ pub fn db_path() -> Result<PathBuf, IdxError> {
         .ok_or_else(|| IdxError::DatabaseError("unable to resolve ownership db path".to_string()))
 }
 
-#[derive(Debug, Clone)]
-struct LatestKseiRelease {
-    sha256: String,
-    as_of_date: NaiveDate,
+/// What a release holds. Derived from its rows, never stored: a schema change
+/// would have to rewrite installed snapshots, whose file hash sync compares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReleaseKind {
+    /// Named holders: an IDX register (XLSX or PDF).
+    Register,
+    /// Only KSEI archive totals per investor type and locality.
+    Aggregate,
 }
 
-fn latest_ksei_release(conn: &Connection) -> Result<Option<LatestKseiRelease>, IdxError> {
-    conn.query_row(
-        "SELECT sha256, as_of_date
-         FROM ownership_releases
-         ORDER BY as_of_date DESC, imported_at DESC
-         LIMIT 1",
-        [],
-        |row| {
-            Ok(LatestKseiRelease {
-                sha256: row.get(0)?,
-                as_of_date: parse_iso_date(&row.get::<_, String>(1)?)
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?,
-            })
-        },
-    )
-    .map(Some)
-    .or_else(|e| match e {
-        rusqlite::Error::QueryReturnedNoRows => Ok(None),
-        _ => Err(IdxError::DatabaseError(e.to_string())),
+/// A release picked for a read.
+#[derive(Debug, Clone)]
+pub(crate) struct ReleaseRef {
+    pub(crate) sha256: String,
+    pub(crate) as_of_date: NaiveDate,
+}
+
+/// `None` for a release without rows (metadata only).
+fn release_kind(conn: &Connection, sha256: &str) -> Result<Option<ReleaseKind>, IdxError> {
+    let sql = format!(
+        "SELECT CASE
+             WHEN EXISTS (SELECT 1 FROM ksei_holdings WHERE release_sha256 = ?1 AND {real}) THEN 1
+             WHEN EXISTS (SELECT 1 FROM ksei_holdings WHERE release_sha256 = ?1) THEN 2
+             ELSE 0
+         END",
+        real = sql_not_aggregate("raw_investor_name"),
+    );
+    let code: i64 = conn
+        .query_row(&sql, params![sha256], |row| row.get(0))
+        .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
+    Ok(match code {
+        1 => Some(ReleaseKind::Register),
+        2 => Some(ReleaseKind::Aggregate),
+        _ => None,
     })
+}
+
+/// Result of walking the releases newest first.
+struct NewestReleases {
+    /// The newest register.
+    register: Option<ReleaseRef>,
+    /// The newest aggregate-only release that sorts ahead of that register
+    /// (newer date, or the same date imported later); with no register at
+    /// all, the newest aggregate-only release.
+    aggregate: Option<ReleaseRef>,
+}
+
+/// Walks releases newest first (`as_of_date`, then import time, then id) and
+/// stops at the first register. A newest-first loop probes one release at a
+/// time: a register answers in microseconds, where an `EXISTS` inside
+/// `ORDER BY ... LIMIT 1` scans every release.
+fn newest_releases(conn: &Connection) -> Result<NewestReleases, IdxError> {
+    let db_err = |e: rusqlite::Error| IdxError::DatabaseError(e.to_string());
+    let mut stmt = conn
+        .prepare(
+            "SELECT sha256, as_of_date
+             FROM ownership_releases
+             ORDER BY as_of_date DESC, imported_at DESC, id DESC",
+        )
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(db_err)?;
+
+    let mut found = NewestReleases {
+        register: None,
+        aggregate: None,
+    };
+    for row in rows {
+        let (sha256, as_of_date) = row.map_err(db_err)?;
+        let Some(kind) = release_kind(conn, &sha256)? else {
+            continue;
+        };
+        let release = ReleaseRef {
+            sha256,
+            as_of_date: parse_iso_date(&as_of_date)?,
+        };
+        match kind {
+            ReleaseKind::Aggregate => {
+                found.aggregate.get_or_insert(release);
+            }
+            ReleaseKind::Register => {
+                found.register = Some(release);
+                break;
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The newest release with named holders. Entity-level reads (entity,
+/// cross-holders, concentration, graph) use only this one: KSEI archive
+/// totals are not holders, however new they are.
+pub(crate) fn latest_holder_release(conn: &Connection) -> Result<Option<ReleaseRef>, IdxError> {
+    Ok(newest_releases(conn)?.register)
+}
+
+/// The release `ticker` lists, with what it needs to say about the choice.
+pub(crate) struct TickerRelease {
+    pub(crate) release: ReleaseRef,
+    /// `release` holds archive totals: the database has no register.
+    pub(crate) aggregate: bool,
+    /// Date of an archive newer than the register in `release`.
+    pub(crate) newer_aggregate_as_of: Option<NaiveDate>,
+}
+
+/// The newest register; archive totals only when the database has no register
+/// at all (the archive is a fallback). An archive never shadows a register,
+/// not even a newer one.
+pub(crate) fn ticker_release(conn: &Connection) -> Result<Option<TickerRelease>, IdxError> {
+    let found = newest_releases(conn)?;
+    Ok(match (found.register, found.aggregate) {
+        (Some(register), aggregate) => Some(TickerRelease {
+            newer_aggregate_as_of: aggregate
+                .map(|archive| archive.as_of_date)
+                .filter(|date| *date > register.as_of_date),
+            release: register,
+            aggregate: false,
+        }),
+        (None, Some(archive)) => Some(TickerRelease {
+            release: archive,
+            aggregate: true,
+            newer_aggregate_as_of: None,
+        }),
+        (None, None) => None,
+    })
+}
+
+/// For entity-level commands: a database that holds KSEI archives but no
+/// register has nothing to answer with, which an empty result would hide.
+/// A database with no releases at all keeps its usual empty answers.
+pub(crate) fn require_holder_release(conn: &Connection) -> Result<(), IdxError> {
+    let found = newest_releases(conn)?;
+    if found.register.is_none() && found.aggregate.is_some() {
+        return Err(IdxError::NoMarketData(
+            "no holder register in the ownership database (it only has KSEI archives, which \
+             hold investor-type totals, not holders); sync the snapshot or import an above-1% \
+             report"
+                .to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn query_ticker(conn: &Connection, code: &str) -> Result<Option<Ticker>, IdxError> {
@@ -1407,14 +1720,18 @@ mod tests {
     use chrono::NaiveDate;
     use rusqlite::{Connection, params};
 
+    use crate::error::IdxError;
     use crate::ownership::db::{
-        compute_concentration, ensure_schema, get_ticker_id, insert_bing_holdings,
-        insert_ksei_holdings, insert_release, query_changes, query_concentration,
-        query_cross_holders, query_ticker_holdings, release_exists, upsert_ticker,
-        write_ksei_release,
+        compute_concentration, ensure_schema, find_entity_id_by_name, get_ticker_id,
+        insert_bing_holdings, insert_ksei_holdings, insert_release, latest_holder_release,
+        manual_map, merge_entities, query_changes, query_concentration, query_cross_holders,
+        query_entity_holdings, query_ticker_holdings, release_exists, require_holder_release,
+        sql_not_aggregate, upsert_ticker, write_ksei_release,
     };
+    use crate::ownership::entities::resolve_entity;
     use crate::ownership::types::{
-        BingHolding, FlowSignal, KseiHolding, Locality, OwnershipRelease,
+        BingHolding, FlowSignal, KseiHolding, Locality, OwnershipRelease, OwnershipSource,
+        is_aggregate_holder,
     };
 
     fn setup() -> Connection {
@@ -2143,5 +2460,496 @@ mod tests {
             real_dir.join("ownership.db")
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn test_sql_aggregate_predicate_matches_rust_definition() {
+        let conn = setup();
+        let predicate = sql_not_aggregate("n");
+        for name in [
+            "KSEI AGGREGATE LOCAL CP",
+            "KSEI AGGREGATE FOREIGN MF",
+            "ksei aggregate local cp",
+            "KSEI AGGREGATE",
+            "KSEI AGGREGATES",
+            " KSEI AGGREGATE LOCAL CP",
+            "PT BANK CENTRAL ASIA TBK",
+        ] {
+            let real: bool = conn
+                .query_row(
+                    &format!("SELECT {predicate} FROM (SELECT ?1 AS n)"),
+                    params![name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(real, !is_aggregate_holder(name), "{name}");
+        }
+    }
+
+    /// Entities an older archive import left behind (one per bucket name).
+    fn legacy_aggregate_entity(conn: &Connection, name: &str) -> i64 {
+        resolve_entity(conn, name, OwnershipSource::Ksei).unwrap()
+    }
+
+    #[test]
+    fn test_entity_lookup_skips_aggregates_and_takes_wildcards_literally() {
+        let conn = setup();
+        legacy_aggregate_entity(&conn, "KSEI AGGREGATE LOCAL CP");
+        let coop = resolve_entity(&conn, "LOCAL COOPERATIVE", OwnershipSource::Ksei).unwrap();
+
+        assert_eq!(find_entity_id_by_name(&conn, "local").unwrap(), Some(coop));
+        assert_eq!(find_entity_id_by_name(&conn, "aggregate").unwrap(), None);
+        assert_eq!(
+            find_entity_id_by_name(&conn, "ksei aggregate local cp").unwrap(),
+            None
+        );
+        assert_eq!(find_entity_id_by_name(&conn, "%").unwrap(), None);
+        assert_eq!(find_entity_id_by_name(&conn, "_").unwrap(), None);
+    }
+
+    #[test]
+    fn test_map_and_merge_reject_aggregate_entities() {
+        let conn = setup();
+        let aggregate = legacy_aggregate_entity(&conn, "KSEI AGGREGATE LOCAL CP");
+        let real = resolve_entity(&conn, "PT REAL HOLDER", OwnershipSource::Ksei).unwrap();
+        let count = |table: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        let before = (count("entities"), count("entity_aliases"));
+
+        for (alias, target) in [
+            ("KSEI AGGREGATE LOCAL CP", "SOME INVESTOR"),
+            ("  ksei   aggregate foreign mf ", "SOME INVESTOR"),
+            ("SOME ALIAS", "KSEI AGGREGATE LOCAL CP"),
+        ] {
+            let err = manual_map(&conn, alias, target).unwrap_err();
+            assert!(matches!(err, IdxError::InvalidInput(_)), "{alias}: {err:?}");
+        }
+        for (keep, merge) in [(real, aggregate), (aggregate, real)] {
+            let err = merge_entities(&conn, keep, merge).unwrap_err();
+            assert!(matches!(err, IdxError::InvalidInput(_)), "{err:?}");
+        }
+
+        assert_eq!((count("entities"), count("entity_aliases")), before);
+        // Ordinary mapping still works.
+        manual_map(&conn, "PT REAL HOLDER LTD", "PT REAL HOLDER").unwrap();
+    }
+
+    fn date(month: u32, day: u32) -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, month, day).unwrap()
+    }
+
+    #[test]
+    fn holder_release_skips_newer_and_same_date_aggregates() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        let holder = resolve_entity(&conn, "PT HOLDER", OwnershipSource::Ksei).unwrap();
+        release_with(
+            &conn,
+            "register",
+            date(8, 31),
+            1,
+            &[(aa, Some(holder), "PT HOLDER", 5000)],
+        );
+        // Imported later at the same date, and a month newer.
+        release_with(
+            &conn,
+            "archive-same",
+            date(8, 31),
+            2,
+            &[(aa, None, "KSEI AGGREGATE LOCAL CP", 6000)],
+        );
+        release_with(
+            &conn,
+            "archive-newer",
+            date(9, 30),
+            3,
+            &[(aa, None, "KSEI AGGREGATE LOCAL CP", 6100)],
+        );
+
+        assert_eq!(
+            latest_holder_release(&conn).unwrap().unwrap().sha256,
+            "register"
+        );
+        require_holder_release(&conn).unwrap();
+    }
+
+    #[test]
+    fn holder_release_is_none_for_aggregate_only_and_metadata_only_databases() {
+        let conn = setup();
+        // No releases at all: usual empty answers, no error.
+        assert!(latest_holder_release(&conn).unwrap().is_none());
+        require_holder_release(&conn).unwrap();
+
+        // A release without rows is neither kind.
+        let metadata_only = OwnershipRelease {
+            id: 0,
+            source_url: None,
+            sha256: "metadata".to_string(),
+            as_of_date: date(7, 31),
+            row_count: 0,
+            imported_at: 1,
+        };
+        insert_release(&conn, &metadata_only).unwrap();
+        assert!(latest_holder_release(&conn).unwrap().is_none());
+        require_holder_release(&conn).unwrap();
+
+        // Archives only: nothing to answer holder questions with.
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        release_with(
+            &conn,
+            "archive",
+            date(8, 31),
+            2,
+            &[(aa, None, "KSEI AGGREGATE LOCAL CP", 6000)],
+        );
+        assert!(latest_holder_release(&conn).unwrap().is_none());
+        let err = require_holder_release(&conn).unwrap_err();
+        assert!(matches!(err, IdxError::NoMarketData(_)), "{err:?}");
+        assert!(err.to_string().contains("KSEI archives"), "{err}");
+    }
+
+    #[test]
+    fn entity_level_reads_ignore_a_newer_aggregate_release() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        let bb = upsert_ticker(&conn, "BB", None).unwrap();
+        let holder = resolve_entity(&conn, "PT HOLDER", OwnershipSource::Ksei).unwrap();
+        let rows = [
+            (aa, Some(holder), "PT HOLDER", 5000),
+            (bb, Some(holder), "PT HOLDER", 4000),
+        ];
+        release_with(&conn, "register", date(8, 31), 1, &rows);
+
+        let cross_before = query_cross_holders(&conn, 2, 10).unwrap();
+        let concentration_before = query_concentration(&conn, "top1", 10).unwrap();
+        let entity_before = query_entity_holdings(&conn, holder).unwrap();
+        assert_eq!(cross_before.len(), 1);
+
+        // What a legacy archive import stored: entity-linked aggregate rows,
+        // newer than the register.
+        let legacy =
+            resolve_entity(&conn, "KSEI AGGREGATE LOCAL CP", OwnershipSource::Ksei).unwrap();
+        release_with(
+            &conn,
+            "archive",
+            date(9, 30),
+            2,
+            &[
+                (aa, Some(legacy), "KSEI AGGREGATE LOCAL CP", 6000),
+                (bb, Some(legacy), "KSEI AGGREGATE LOCAL CP", 7000),
+            ],
+        );
+
+        let cross_after = query_cross_holders(&conn, 2, 10).unwrap();
+        assert_eq!(
+            cross_after.iter().map(|r| r.entity.id).collect::<Vec<_>>(),
+            cross_before.iter().map(|r| r.entity.id).collect::<Vec<_>>()
+        );
+        let concentration_after = query_concentration(&conn, "top1", 10).unwrap();
+        assert_eq!(concentration_after.len(), concentration_before.len());
+        for (after, before) in concentration_after.iter().zip(&concentration_before) {
+            assert_eq!((&after.0, after.1.top1_bps), (&before.0, before.1.top1_bps));
+        }
+        let entity_after = query_entity_holdings(&conn, holder).unwrap();
+        assert_eq!(entity_after.holdings.len(), entity_before.holdings.len());
+    }
+
+    #[test]
+    fn ticker_prefers_the_register_and_reports_a_newer_archive() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        let holder = resolve_entity(&conn, "PT HOLDER", OwnershipSource::Ksei).unwrap();
+        release_with(
+            &conn,
+            "register",
+            date(8, 31),
+            1,
+            &[(aa, Some(holder), "PT HOLDER", 5000)],
+        );
+        release_with(
+            &conn,
+            "archive",
+            date(9, 30),
+            2,
+            &[
+                (aa, None, "KSEI AGGREGATE LOCAL CP", 6000),
+                (aa, None, "KSEI AGGREGATE FOREIGN MF", 3000),
+            ],
+        );
+
+        let data = query_ticker_holdings(&conn, "AA").unwrap();
+        assert_eq!(data.ksei_as_of, Some(date(8, 31)));
+        assert!(!data.ksei_aggregate);
+        assert_eq!(data.newer_aggregate_as_of, Some(date(9, 30)));
+        assert_eq!(data.holders.len(), 1);
+        assert_eq!(data.holders[0].percentage_bps, 5000);
+        assert_eq!(data.concentration.top1_bps, 5000);
+    }
+
+    #[test]
+    fn ticker_ignores_a_same_date_archive_imported_later() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        let holder = resolve_entity(&conn, "PT HOLDER", OwnershipSource::Ksei).unwrap();
+        release_with(
+            &conn,
+            "register",
+            date(8, 31),
+            1,
+            &[(aa, Some(holder), "PT HOLDER", 5000)],
+        );
+        release_with(
+            &conn,
+            "archive",
+            date(8, 31),
+            2,
+            &[(aa, None, "KSEI AGGREGATE LOCAL CP", 6000)],
+        );
+        // And an older archive, which is neither newer nor shown.
+        release_with(
+            &conn,
+            "old-archive",
+            date(7, 31),
+            3,
+            &[(aa, None, "KSEI AGGREGATE LOCAL CP", 6100)],
+        );
+
+        let data = query_ticker_holdings(&conn, "AA").unwrap();
+        assert_eq!(data.ksei_as_of, Some(date(8, 31)));
+        assert!(!data.ksei_aggregate);
+        assert_eq!(data.newer_aggregate_as_of, None);
+        assert_eq!(data.holders.len(), 1);
+        assert_eq!(data.holders[0].percentage_bps, 5000);
+    }
+
+    #[test]
+    fn ticker_on_an_archive_only_database_flags_totals_and_ignores_legacy_entity_links() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        // An older import linked the aggregate rows to entities.
+        let legacy =
+            resolve_entity(&conn, "KSEI AGGREGATE LOCAL CP", OwnershipSource::Ksei).unwrap();
+        release_with(
+            &conn,
+            "archive",
+            date(9, 30),
+            1,
+            &[
+                (aa, Some(legacy), "KSEI AGGREGATE LOCAL CP", 6000),
+                (aa, None, "KSEI AGGREGATE FOREIGN MF", 3000),
+            ],
+        );
+
+        let data = query_ticker_holdings(&conn, "AA").unwrap();
+        assert_eq!(data.ksei_as_of, Some(date(9, 30)));
+        assert!(data.ksei_aggregate);
+        assert_eq!(data.newer_aggregate_as_of, None);
+        let rows: Vec<_> = data
+            .holders
+            .iter()
+            .map(|h| (h.name.as_str(), h.entity_id, h.percentage_bps))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("KSEI AGGREGATE LOCAL CP", None, 6000),
+                ("KSEI AGGREGATE FOREIGN MF", None, 3000),
+            ]
+        );
+        // Unchanged: still computed over those rows.
+        assert_eq!(data.concentration.top1_bps, 6000);
+    }
+
+    #[test]
+    fn ticker_json_carries_the_archive_flags_only_when_they_apply() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        let holder = resolve_entity(&conn, "PT HOLDER", OwnershipSource::Ksei).unwrap();
+        release_with(
+            &conn,
+            "register",
+            date(8, 31),
+            1,
+            &[(aa, Some(holder), "PT HOLDER", 5000)],
+        );
+        let plain = serde_json::to_value(query_ticker_holdings(&conn, "AA").unwrap()).unwrap();
+        assert!(plain.get("ksei_aggregate").is_none(), "{plain}");
+        assert!(plain.get("newer_aggregate_as_of").is_none(), "{plain}");
+
+        release_with(
+            &conn,
+            "archive",
+            date(9, 30),
+            2,
+            &[(aa, None, "KSEI AGGREGATE LOCAL CP", 6000)],
+        );
+        let newer = serde_json::to_value(query_ticker_holdings(&conn, "AA").unwrap()).unwrap();
+        assert_eq!(newer["newer_aggregate_as_of"], "2026-09-30");
+        assert!(newer.get("ksei_aggregate").is_none(), "{newer}");
+
+        let archive_only = setup();
+        let bb = upsert_ticker(&archive_only, "BB", None).unwrap();
+        release_with(
+            &archive_only,
+            "archive",
+            date(9, 30),
+            1,
+            &[(bb, None, "KSEI AGGREGATE LOCAL CP", 6000)],
+        );
+        let totals =
+            serde_json::to_value(query_ticker_holdings(&archive_only, "BB").unwrap()).unwrap();
+        assert_eq!(totals["ksei_aggregate"], true);
+    }
+
+    #[test]
+    fn changes_pair_releases_of_one_kind() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        let holder = resolve_entity(&conn, "PT HOLDER", OwnershipSource::Ksei).unwrap();
+        release_with(
+            &conn,
+            "reg-jan",
+            date(1, 31),
+            1,
+            &[(aa, Some(holder), "PT HOLDER", 5000)],
+        );
+        release_with(
+            &conn,
+            "arc-jan",
+            date(1, 30),
+            2,
+            &[(aa, None, "KSEI AGGREGATE LOCAL CP", 6000)],
+        );
+        release_with(
+            &conn,
+            "reg-feb",
+            date(2, 27),
+            3,
+            &[(aa, Some(holder), "PT HOLDER", 4000)],
+        );
+        // Same date as the Feb register and imported after it: it used to win.
+        release_with(
+            &conn,
+            "arc-feb",
+            date(2, 27),
+            4,
+            &[(aa, None, "KSEI AGGREGATE LOCAL CP", 5900)],
+        );
+
+        let registers = query_changes(&conn, "2026-01-31", "2026-02-27").unwrap();
+        assert_eq!(registers.len(), 1, "{registers:?}");
+        assert_eq!(
+            (registers[0].old_bps, registers[0].new_bps),
+            (Some(5000), Some(4000))
+        );
+        assert!(!registers[0].entity_name.starts_with("KSEI AGGREGATE"));
+
+        let archives = query_changes(&conn, "2026-01-30", "2026-02-27").unwrap();
+        assert_eq!(archives.len(), 1, "{archives:?}");
+        assert_eq!(archives[0].entity_name, "KSEI AGGREGATE LOCAL CP");
+        assert_eq!(
+            (archives[0].old_bps, archives[0].new_bps),
+            (Some(6000), Some(5900))
+        );
+
+        // A register date against an archive-only date: no meaningful diff.
+        let err = query_changes(&conn, "2026-01-31", "2026-01-30").unwrap_err();
+        assert!(matches!(err, IdxError::InvalidInput(_)), "{err:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("2026-01-31 (holder register)"),
+            "{message}"
+        );
+        assert!(message.contains("2026-01-30 (KSEI archive)"), "{message}");
+        assert!(
+            message.contains("Holder register dates: 2026-02-27, 2026-01-31."),
+            "{message}"
+        );
+        assert!(
+            message.contains("KSEI archive dates: 2026-02-27, 2026-01-30."),
+            "{message}"
+        );
+        assert!(query_changes(&conn, "2026-01-30", "2026-01-31").is_err());
+    }
+
+    #[test]
+    fn changes_between_archives_match_across_legacy_and_new_imports() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        // The January archive was imported when aggregates still got entities.
+        let legacy =
+            resolve_entity(&conn, "KSEI AGGREGATE LOCAL CP", OwnershipSource::Ksei).unwrap();
+        release_with(
+            &conn,
+            "arc-jan",
+            date(1, 30),
+            1,
+            &[(aa, Some(legacy), "KSEI AGGREGATE LOCAL CP", 6000)],
+        );
+        release_with(
+            &conn,
+            "arc-feb",
+            date(2, 27),
+            2,
+            &[(aa, None, "KSEI AGGREGATE LOCAL CP", 5900)],
+        );
+
+        let changes = query_changes(&conn, "2026-01-30", "2026-02-27").unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!(changes[0].entity_name, "KSEI AGGREGATE LOCAL CP");
+        assert_eq!(
+            (changes[0].old_bps, changes[0].new_bps),
+            (Some(6000), Some(5900))
+        );
+    }
+
+    #[test]
+    fn changes_against_a_date_without_releases_compare_with_nothing() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        let holder = resolve_entity(&conn, "PT HOLDER", OwnershipSource::Ksei).unwrap();
+        release_with(
+            &conn,
+            "reg-feb",
+            date(2, 27),
+            1,
+            &[(aa, Some(holder), "PT HOLDER", 4000)],
+        );
+
+        let changes = query_changes(&conn, "2026-01-01", "2026-02-27").unwrap();
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        assert_eq!((changes[0].old_bps, changes[0].new_bps), (None, Some(4000)));
+    }
+
+    #[test]
+    fn unresolved_list_ignores_aggregate_rows() {
+        let conn = setup();
+        let aa = upsert_ticker(&conn, "AA", None).unwrap();
+        // Archive totals have no entity; a register holder can lack one too.
+        release_with(
+            &conn,
+            "archive",
+            date(8, 31),
+            1,
+            &[
+                (aa, None, "KSEI AGGREGATE LOCAL CP", 6000),
+                (aa, None, "KSEI AGGREGATE FOREIGN MF", 3000),
+            ],
+        );
+        release_with(
+            &conn,
+            "register",
+            date(9, 30),
+            2,
+            &[(aa, None, "PT UNMATCHED HOLDER", 2000)],
+        );
+
+        let rows = super::list_unresolved(&conn, 50).unwrap();
+        let names: Vec<_> = rows.iter().map(|row| row.raw_name.as_str()).collect();
+        assert_eq!(names, vec!["PT UNMATCHED HOLDER"]);
     }
 }

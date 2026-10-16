@@ -15,6 +15,7 @@ use idx_core::investor::{
 use idx_core::ownership::graph;
 use idx_core::ownership::snapshot;
 use idx_core::ownership::types::{ChangeType, FlowSignal, HolderRow, OwnershipSource};
+use idx_core::runtime;
 
 #[derive(Debug, Args)]
 #[command(
@@ -309,6 +310,25 @@ fn handle_discover(
     Ok(())
 }
 
+/// Says on stderr what the KSEI rows below are when that is not obvious.
+fn explain_ticker_release(data: &idx_core::ownership::types::TickerOwnership) {
+    let date = |date: chrono::NaiveDate| date.format("%Y-%m-%d").to_string();
+    if data.ksei_aggregate {
+        runtime::info(
+            "showing KSEI archive totals per investor type and locality, not individual \
+             holders; sync the snapshot or import an above-1% report for named holders",
+        );
+    }
+    if let (Some(newer), Some(shown)) = (data.newer_aggregate_as_of, data.ksei_as_of) {
+        runtime::info(format!(
+            "a newer KSEI archive ({}) holds investor-type totals only and is not shown; \
+             showing the holder register ({})",
+            date(newer),
+            date(shown)
+        ));
+    }
+}
+
 fn handle_ticker(
     investor: &Investor,
     args: &TickerArgs,
@@ -318,7 +338,12 @@ fn handle_ticker(
     let data = investor.ticker(&args.symbol, source)?;
 
     if config.output.is_json() {
+        // The same facts are in the document (`ksei_aggregate`,
+        // `newer_aggregate_as_of`); stderr stays empty.
         return json::print_json(&data);
+    }
+    if source != HolderSource::Bing {
+        explain_ticker_release(&data);
     }
 
     println!(

@@ -1,6 +1,7 @@
 use rusqlite::{Connection, params};
 
 use crate::error::IdxError;
+use crate::ownership::db::sql_not_aggregate;
 use crate::ownership::types::Entity;
 
 pub fn fts_search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Entity>, IdxError> {
@@ -79,13 +80,14 @@ fn fts_query(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Entity>, 
 
 fn like_query(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Entity>, IdxError> {
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT id, canonical_name, entity_type, country
-             FROM entities
-             WHERE canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE
-             ORDER BY canonical_name ASC
-             LIMIT ?2",
-        )
+                 FROM entities
+                 WHERE canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE AND {}
+                 ORDER BY canonical_name ASC
+                 LIMIT ?2",
+            sql_not_aggregate("canonical_name")
+        ))
         .map_err(|e| IdxError::DatabaseError(e.to_string()))?;
 
     let like = like_pattern(query);
@@ -108,9 +110,10 @@ fn like_query(conn: &Connection, query: &str, limit: i64) -> Result<Vec<Entity>,
 }
 
 /// (Re)build the connection-local search index over entity names and
-/// aliases.
+/// aliases. Aggregate pseudo-holders (entities, or aliases attached to a real
+/// entity) are left out.
 pub fn rebuild_fts(conn: &Connection) -> Result<(), IdxError> {
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS temp.entity_search USING fts5(
              canonical_name,
              aliases,
@@ -123,9 +126,13 @@ pub fn rebuild_fts(conn: &Connection) -> Result<(), IdxError> {
          LEFT JOIN (
              SELECT entity_id, GROUP_CONCAT(raw_name, ' ') AS aliases
              FROM main.entity_aliases
+             WHERE {alias_ok}
              GROUP BY entity_id
-         ) a ON a.entity_id = e.id;",
-    )
+         ) a ON a.entity_id = e.id
+         WHERE {entity_ok};",
+        alias_ok = sql_not_aggregate("raw_name"),
+        entity_ok = sql_not_aggregate("e.canonical_name"),
+    ))
     .map_err(|e| IdxError::DatabaseError(e.to_string()))
 }
 
@@ -201,6 +208,28 @@ mod tests {
         }
         assert_eq!(std::fs::read(&path).unwrap(), before);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn search_hides_aggregate_entities_and_aliases() {
+        let conn = setup();
+        // What an older archive import left behind: one entity per bucket, and
+        // an alias of that kind attached to a real entity by a manual mapping.
+        resolve_entity(&conn, "KSEI AGGREGATE LOCAL CP", OwnershipSource::Ksei).unwrap();
+        let real =
+            resolve_entity(&conn, "PT BANK CENTRAL ASIA TBK", OwnershipSource::Ksei).unwrap();
+        conn.execute(
+            "INSERT INTO entity_aliases (entity_id, raw_name, source, confidence, method)
+             VALUES (?1, 'KSEI AGGREGATE FOREIGN MF', 'bing', 1.0, 'manual')",
+            params![real],
+        )
+        .unwrap();
+
+        for query in ["aggregate", "local cp", "foreign mf"] {
+            assert!(fts_search(&conn, query, 10).unwrap().is_empty(), "{query}");
+        }
+        let found = fts_search(&conn, "central", 10).unwrap();
+        assert_eq!(found.iter().map(|e| e.id).collect::<Vec<_>>(), vec![real]);
     }
 
     #[test]

@@ -5,7 +5,9 @@ use std::path::Path;
 use chrono::NaiveDate;
 
 use crate::error::IdxError;
-use crate::ownership::types::{InvestorTypeCode, KseiHoldingDraft, Locality};
+use crate::ownership::types::{
+    AGGREGATE_HOLDER_PREFIX, InvestorTypeCode, KseiHoldingDraft, Locality,
+};
 
 const EXPECTED_HEADER: &[&str] = &[
     "Date",
@@ -281,7 +283,7 @@ fn synthetic_holder_name(locality: Locality, investor_type: &str) -> String {
         Locality::Local => "LOCAL",
         Locality::Foreign => "FOREIGN",
     };
-    format!("KSEI AGGREGATE {prefix} {investor_type}")
+    format!("{AGGREGATE_HOLDER_PREFIX}{prefix} {investor_type}")
 }
 
 fn compute_percentage_bps(shares: i64, sec_num: i64) -> i64 {
@@ -293,10 +295,40 @@ fn compute_percentage_bps(shares: i64, sec_num: i64) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_balancepos_text;
+    use super::{FOREIGN_BUCKETS, LOCAL_BUCKETS, parse_balancepos_text, synthetic_holder_name};
     use crate::ownership::entities::normalize_ksei_row;
     use crate::ownership::parser::parse_stext_xml;
-    use crate::ownership::types::Locality;
+    use crate::ownership::types::{Locality, is_aggregate_holder};
+
+    #[test]
+    fn every_archive_bucket_name_is_an_aggregate_holder() {
+        let mut count = 0;
+        for (locality, buckets) in [
+            (Locality::Local, LOCAL_BUCKETS),
+            (Locality::Foreign, FOREIGN_BUCKETS),
+        ] {
+            for (investor_type, _) in buckets {
+                let name = synthetic_holder_name(locality, investor_type);
+                assert!(is_aggregate_holder(&name), "{name}");
+                count += 1;
+            }
+        }
+        assert_eq!(count, 18);
+    }
+
+    #[test]
+    fn aggregate_holder_check_is_exact() {
+        for real in [
+            "PT BANK CENTRAL ASIA TBK",
+            "KSEI AGGREGATE",
+            "ksei aggregate local cp",
+            " KSEI AGGREGATE LOCAL CP",
+            "THE KSEI AGGREGATE LOCAL CP",
+        ] {
+            assert!(!is_aggregate_holder(real), "{real}");
+        }
+        assert!(is_aggregate_holder("KSEI AGGREGATE FOREIGN MF"));
+    }
 
     #[test]
     fn parses_balancepos_excerpt_into_bucket_holders() {

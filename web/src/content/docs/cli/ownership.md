@@ -62,6 +62,25 @@ idx ownership import --file report.xlsx    # or a local XLSX, PDF, ZIP or TXT
 Since June 2026 IDX publishes the register as XLSX; earlier months were PDF
 announcements, which need `mutool`. See [helper tools](/start/install/#helper-tools).
 
+## KSEI archives
+
+A KSEI archive (`BalanceposEfek*.zip` or `.txt`) is a different kind of file:
+holdings totalled per investor type and locality ("KSEI AGGREGATE LOCAL CP",
+"KSEI AGGREGATE FOREIGN MF", up to 18 rows a stock), not a list of investors.
+It is a fallback for a month without a register, and idx treats it that way:
+
+- `ticker` shows the newest register. It shows archive totals only when you
+  have no register at all, and then marks them: `"ksei_aggregate": true` in
+  JSON, a note on stderr in table mode. A newer archive that was not used is
+  reported as `newer_aggregate_as_of`.
+- `entity`, `cross-holders`, `concentration` and `graph` read the newest
+  register. With only archives imported they fail (exit 3) and say so.
+- `changes` compares two registers or two archives. A register date against an
+  archive date is an error that lists the dates of each kind.
+- Archive rows are never investors: `search`, `entity` and `resolve` do not
+  see them. If your database was built by an older version, re-import an
+  archive with `--force` to drop its links to those entities.
+
 ## Entity names
 
 The register spells some investors differently from month to month.

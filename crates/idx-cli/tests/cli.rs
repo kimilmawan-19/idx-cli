@@ -2424,3 +2424,459 @@ fn invalid_exchange_is_rejected_before_any_request() {
         .stdout("")
         .stderr(predicate::str::contains("invalid exchange"));
 }
+
+/// What the entity-level commands print for a database (one JSON document
+/// each), in a fixed order.
+fn entity_level_outputs(root: &Path) -> Vec<String> {
+    [
+        vec![
+            "-o",
+            "json",
+            "ownership",
+            "cross-holders",
+            "--min-tickers",
+            "1",
+            "--top",
+            "20",
+        ],
+        vec!["-o", "json", "ownership", "concentration", "--top", "5"],
+        vec!["-o", "json", "ownership", "entity", "ADARO STRATEGIC"],
+        vec!["-o", "json", "ownership", "graph", "AADI", "--depth", "2"],
+        vec!["-o", "json", "ownership", "search", "adaro"],
+    ]
+    .iter()
+    .map(|args| run_success_stdout(bin_with_root(root).args(args)))
+    .collect()
+}
+
+fn import_archive_text(root: &Path, file_name: &str, text: &str) {
+    let path = root.join(file_name);
+    fs::write(&path, text).expect("write archive fixture");
+    run_success_stdout(bin_with_root(root).args([
+        "ownership",
+        "import",
+        "--file",
+        path.to_str().unwrap(),
+    ]));
+}
+
+#[test]
+fn ownership_archives_never_shadow_the_register() {
+    let root = test_env_dir("archives-never-shadow-register");
+    prepare_snapshot_fixture(&root);
+    let before = entity_level_outputs(&root);
+
+    let jan = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt");
+    let feb = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt");
+    // Older than the registers; the same date as the Feb register but imported
+    // later (it used to win on import time); and newer than every register.
+    import_archive_text(&root, "Balancepos20260130.txt", jan);
+    import_archive_text(&root, "Balancepos20260227.txt", feb);
+    import_archive_text(
+        &root,
+        "Balancepos20260331.txt",
+        &feb.replace("27-FEB-2026", "31-MAR-2026"),
+    );
+
+    let releases =
+        run_success_json(bin_with_root(&root).args(["-o", "json", "ownership", "releases"]));
+    assert_eq!(releases.as_array().unwrap().len(), 5, "{releases}");
+    assert_eq!(releases[0]["as_of_date"], "2026-03-31");
+    assert_eq!(entity_level_outputs(&root), before);
+}
+
+#[test]
+fn ownership_archive_only_database_rejects_entity_level_commands() {
+    let root = test_env_dir("archive-only-entity-level");
+    let db_path = root.join("ownership.db");
+    run_success_stdout(bin_with_root(&root).args([
+        "config",
+        "set",
+        "ownership.db_path",
+        db_path.to_str().unwrap(),
+    ]));
+    import_archive_text(
+        &root,
+        "Balancepos20260130.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt"),
+    );
+    import_archive_text(
+        &root,
+        "Balancepos20260227.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt"),
+    );
+
+    for args in [
+        vec!["cross-holders"],
+        vec!["concentration"],
+        vec!["entity", "ADARO"],
+        vec!["graph", "AADI"],
+    ] {
+        let mut full = vec!["-o", "json", "ownership"];
+        full.extend(args);
+        run_error_json(bin_with_root(&root).args(full), "NOMARKETDATA");
+    }
+    bin_with_root(&root)
+        .args(["ownership", "cross-holders"])
+        .assert()
+        .code(3)
+        .stdout("")
+        .stderr(predicate::str::contains("KSEI archives"));
+
+    // What an archive does hold is still readable.
+    let ticker =
+        run_success_json(bin_with_root(&root).args(["-o", "json", "ownership", "ticker", "AADI"]));
+    assert_eq!(ticker["holders"].as_array().map(Vec::len), Some(18));
+    let changes = run_success_json(bin_with_root(&root).args([
+        "-o",
+        "json",
+        "ownership",
+        "changes",
+        "--from",
+        "2026-01-30",
+        "--to",
+        "2026-02-27",
+    ]));
+    assert!(changes.as_array().is_some_and(|rows| !rows.is_empty()));
+}
+
+#[test]
+fn ownership_ticker_prefers_the_register_over_archives() {
+    let root = test_env_dir("ticker-prefers-register");
+    prepare_snapshot_fixture(&root);
+    let ticker_json = |root: &Path| {
+        run_success_json(bin_with_root(root).args([
+            "-o",
+            "json",
+            "ownership",
+            "ticker",
+            "AADI",
+            "--source",
+            "ksei",
+        ]))
+    };
+    let before = ticker_json(&root);
+    assert_eq!(before["ksei_as_of"], "2026-02-27");
+    assert!(before.get("ksei_aggregate").is_none(), "{before}");
+    assert!(before.get("newer_aggregate_as_of").is_none(), "{before}");
+
+    let jan = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt");
+    let feb = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt");
+    // Older, and the same date as the Feb register but imported later.
+    import_archive_text(&root, "Balancepos20260130.txt", jan);
+    import_archive_text(&root, "Balancepos20260227.txt", feb);
+    assert_eq!(ticker_json(&root), before);
+    bin_with_root(&root)
+        .args(["ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stderr("");
+
+    // Newer than every register: still not shown, but said.
+    import_archive_text(
+        &root,
+        "Balancepos20260331.txt",
+        &feb.replace("27-FEB-2026", "31-MAR-2026"),
+    );
+    let mut expected = before.clone();
+    expected["newer_aggregate_as_of"] = serde_json::json!("2026-03-31");
+    assert_eq!(ticker_json(&root), expected);
+
+    bin_with_root(&root)
+        .args(["ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "a newer KSEI archive (2026-03-31)",
+        ))
+        .stderr(predicate::str::contains(
+            "showing the holder register (2026-02-27)",
+        ));
+    bin_with_root(&root)
+        .args(["--quiet", "ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stderr("");
+    // Nothing on stderr in JSON mode: the document says it.
+    bin_with_root(&root)
+        .args([
+            "-o",
+            "json",
+            "ownership",
+            "ticker",
+            "AADI",
+            "--source",
+            "ksei",
+        ])
+        .assert()
+        .success()
+        .stderr("");
+}
+
+#[test]
+fn ownership_ticker_on_an_archive_only_database_says_what_it_shows() {
+    let root = test_env_dir("ticker-archive-only");
+    let db_path = root.join("ownership.db");
+    run_success_stdout(bin_with_root(&root).args([
+        "config",
+        "set",
+        "ownership.db_path",
+        db_path.to_str().unwrap(),
+    ]));
+    import_archive_text(
+        &root,
+        "Balancepos20260227.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt"),
+    );
+
+    let ticker = run_success_json(bin_with_root(&root).args([
+        "-o",
+        "json",
+        "ownership",
+        "ticker",
+        "AADI",
+        "--source",
+        "ksei",
+    ]));
+    assert_eq!(ticker["ksei_aggregate"], true, "{ticker}");
+    assert!(ticker.get("newer_aggregate_as_of").is_none(), "{ticker}");
+    let holders = ticker["holders"].as_array().unwrap();
+    assert_eq!(holders.len(), 18);
+    assert!(holders.iter().all(|row| row["entity_id"].is_null()));
+
+    bin_with_root(&root)
+        .args(["ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("KSEI AGGREGATE LOCAL CP"))
+        .stderr(predicate::str::contains(
+            "showing KSEI archive totals per investor type and locality",
+        ));
+    bin_with_root(&root)
+        .args(["--quiet", "ownership", "ticker", "AADI", "--source", "ksei"])
+        .assert()
+        .success()
+        .stderr("");
+}
+
+#[test]
+fn ownership_changes_compare_releases_of_one_kind() {
+    let root = test_env_dir("changes-one-kind");
+    prepare_snapshot_fixture(&root);
+    let changes = |root: &Path, from: &str, to: &str| {
+        run_success_json(bin_with_root(root).args([
+            "-o",
+            "json",
+            "ownership",
+            "changes",
+            "--from",
+            from,
+            "--to",
+            to,
+        ]))
+    };
+    let registers_before = changes(&root, "2026-01-31", "2026-02-27");
+    assert!(!registers_before.as_array().unwrap().is_empty());
+
+    // An archive for the register's own date, imported later, used to win.
+    import_archive_text(
+        &root,
+        "Balancepos20260130.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt"),
+    );
+    import_archive_text(
+        &root,
+        "Balancepos20260227.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt"),
+    );
+    assert_eq!(changes(&root, "2026-01-31", "2026-02-27"), registers_before);
+
+    let archives = changes(&root, "2026-01-30", "2026-02-27");
+    let archives = archives.as_array().unwrap();
+    assert!(!archives.is_empty());
+    assert!(archives.iter().all(|row| {
+        row["entity_name"]
+            .as_str()
+            .is_some_and(|name| name.starts_with("KSEI AGGREGATE "))
+    }));
+
+    bin_with_root(&root)
+        .args([
+            "-o",
+            "json",
+            "ownership",
+            "changes",
+            "--from",
+            "2026-01-31",
+            "--to",
+            "2026-01-30",
+        ])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "cannot compare 2026-01-31 (holder register) with 2026-01-30 (KSEI archive)",
+        ))
+        .stderr(predicate::str::contains("INVALIDINPUT"));
+}
+
+#[test]
+fn ownership_archive_import_creates_no_entities() {
+    let root = test_env_dir("archive-import-no-entities");
+    let db_path = root.join("ownership.db");
+    run_success_stdout(bin_with_root(&root).args([
+        "config",
+        "set",
+        "ownership.db_path",
+        db_path.to_str().unwrap(),
+    ]));
+    import_archive_text(
+        &root,
+        "Balancepos20260227.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt"),
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+    assert_eq!(count("SELECT COUNT(*) FROM ksei_holdings"), 18);
+    assert_eq!(
+        count("SELECT COUNT(*) FROM ksei_holdings WHERE entity_id IS NOT NULL"),
+        0
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM entities"), 0);
+    assert_eq!(count("SELECT COUNT(*) FROM entity_aliases"), 0);
+
+    let unresolved = run_success_json(bin_with_root(&root).args([
+        "-o",
+        "json",
+        "ownership",
+        "resolve",
+        "unresolved",
+    ]));
+    assert_eq!(unresolved, serde_json::json!([]));
+}
+
+#[test]
+fn ownership_legacy_aggregate_entities_are_hidden() {
+    let root = test_env_dir("legacy-aggregate-entities");
+    prepare_snapshot_fixture(&root);
+    let db_path = root.join("published-ownership.db");
+    let feb = include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260227_excerpt.txt");
+    import_archive_text(
+        &root,
+        "Balancepos20260130.txt",
+        include_str!("../../idx-core/tests/fixtures/ksei_balancepos_20260130_excerpt.txt"),
+    );
+    import_archive_text(&root, "Balancepos20260227.txt", feb);
+
+    let observe = |root: &Path| {
+        let mut outputs = entity_level_outputs(root);
+        for args in [
+            vec!["-o", "json", "ownership", "search", "aggregate"],
+            vec!["-o", "json", "ownership", "resolve", "unresolved"],
+            vec![
+                "-o",
+                "json",
+                "ownership",
+                "changes",
+                "--from",
+                "2026-01-30",
+                "--to",
+                "2026-02-27",
+            ],
+            vec![
+                "-o",
+                "json",
+                "ownership",
+                "ticker",
+                "AADI",
+                "--source",
+                "ksei",
+            ],
+        ] {
+            outputs.push(run_success_stdout(bin_with_root(root).args(args)));
+        }
+        outputs
+    };
+    let before = observe(&root);
+    assert_eq!(before[5].trim(), "[]", "search aggregate: {}", before[5]);
+
+    // What an older import left behind: an entity and an alias per bucket
+    // name, and the holdings linked to them.
+    let counts = |sql: &str| -> i64 {
+        Connection::open(&db_path)
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    };
+    Connection::open(&db_path)
+        .unwrap()
+        .execute_batch(
+            "INSERT INTO entities (canonical_name, created_at, updated_at)
+               SELECT DISTINCT raw_investor_name, 0, 0 FROM ksei_holdings
+               WHERE raw_investor_name GLOB 'KSEI AGGREGATE *';
+             INSERT INTO entity_aliases (entity_id, raw_name, source, confidence, method)
+               SELECT id, canonical_name, 'ksei', 1.0, 'exact' FROM entities
+               WHERE canonical_name GLOB 'KSEI AGGREGATE *';
+             UPDATE ksei_holdings
+               SET entity_id = (SELECT entity_id FROM entity_aliases a
+                                WHERE a.raw_name = ksei_holdings.raw_investor_name)
+               WHERE raw_investor_name GLOB 'KSEI AGGREGATE *';",
+        )
+        .unwrap();
+    assert_eq!(
+        counts("SELECT COUNT(*) FROM entities WHERE canonical_name GLOB 'KSEI AGGREGATE *'"),
+        18
+    );
+    assert_eq!(observe(&root), before);
+
+    // They cannot be looked up, mapped or merged.
+    bin_with_root(&root)
+        .args([
+            "-o",
+            "json",
+            "ownership",
+            "entity",
+            "KSEI AGGREGATE LOCAL CP",
+        ])
+        .assert()
+        .failure()
+        .stdout("");
+    for args in [
+        vec!["resolve", "map", "KSEI AGGREGATE LOCAL CP", "SOME INVESTOR"],
+        vec!["resolve", "map", "SOME ALIAS", "KSEI AGGREGATE LOCAL CP"],
+        vec!["resolve", "merge", "1", "2"],
+    ] {
+        let mut full = vec!["-o", "json", "ownership"];
+        full.extend(args);
+        bin_with_root(&root)
+            .args(full)
+            .assert()
+            .code(2)
+            .stdout("")
+            .stderr(predicate::str::contains("INVALIDINPUT"));
+    }
+    assert_eq!(counts("SELECT COUNT(*) FROM entities"), 19);
+    assert_eq!(observe(&root), before);
+
+    // Re-importing a month with --force drops its links to those entities;
+    // the January month keeps its own, and the two still line up.
+    let linked = |date: &str| {
+        counts(&format!(
+            "SELECT COUNT(*) FROM ksei_holdings
+             WHERE report_date = '{date}' AND entity_id IS NOT NULL
+               AND raw_investor_name GLOB 'KSEI AGGREGATE *'"
+        ))
+    };
+    assert_eq!((linked("2026-01-30"), linked("2026-02-27")), (18, 18));
+    let feb_path = root.join("Balancepos20260227.txt");
+    run_success_stdout(bin_with_root(&root).args([
+        "ownership",
+        "import",
+        "--file",
+        feb_path.to_str().unwrap(),
+        "--force",
+    ]));
+    assert_eq!((linked("2026-01-30"), linked("2026-02-27")), (18, 0));
+    assert_eq!(observe(&root), before);
+}

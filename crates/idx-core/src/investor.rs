@@ -19,7 +19,7 @@ use crate::ownership::snapshot::{self, OwnershipSyncResult};
 use crate::ownership::types::{
     ChangeRow, ConcentrationMetrics, CrossHolderRow, Entity, EntityHoldings, GraphEdge, GraphNode,
     InstitutionalFlow, KseiHolding, OwnershipRelease, OwnershipSource, TickerOwnership,
-    UnresolvedRow,
+    UnresolvedRow, is_aggregate_holder,
 };
 use crate::ownership::{archive, db, entities, graph, parser, search, xlsx};
 
@@ -135,14 +135,9 @@ impl Investor {
     /// canonical name containing it).
     pub fn entity(&self, name: &str) -> Result<EntityHoldings, IdxError> {
         let conn = self.connect()?;
-        let pattern = search::like_pattern(name.trim());
-        let entity_id = conn
-            .query_row(
-                "SELECT id FROM entities WHERE canonical_name LIKE ?1 ESCAPE '\\' COLLATE NOCASE ORDER BY LENGTH(canonical_name) ASC LIMIT 1",
-                rusqlite::params![pattern],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|_| IdxError::ParseError(format!("entity not found: {name}")))?;
+        db::require_holder_release(&conn)?;
+        let entity_id = db::find_entity_id_by_name(&conn, name)?
+            .ok_or_else(|| IdxError::ParseError(format!("entity not found: {name}")))?;
         db::query_entity_holdings(&conn, entity_id)
     }
 
@@ -155,7 +150,9 @@ impl Investor {
         min_tickers: usize,
         top: usize,
     ) -> Result<Vec<CrossHolderRow>, IdxError> {
-        db::query_cross_holders(&*self.connect()?, min_tickers, top)
+        let conn = self.connect()?;
+        db::require_holder_release(&conn)?;
+        db::query_cross_holders(&conn, min_tickers, top)
     }
 
     pub fn concentration(
@@ -163,7 +160,9 @@ impl Investor {
         by: ConcentrationRank,
         top: usize,
     ) -> Result<Vec<(String, ConcentrationMetrics)>, IdxError> {
-        db::query_concentration(&*self.connect()?, by.as_str(), top)
+        let conn = self.connect()?;
+        db::require_holder_release(&conn)?;
+        db::query_concentration(&conn, by.as_str(), top)
     }
 
     /// Institutional (Bing) flow; `None` when no flow data exists.
@@ -216,7 +215,9 @@ impl Investor {
         root: &str,
         depth: usize,
     ) -> Result<(Vec<GraphNode>, Vec<GraphEdge>), IdxError> {
-        graph::query_ownership_graph(&*self.connect()?, root, depth)
+        let conn = self.connect()?;
+        db::require_holder_release(&conn)?;
+        graph::query_ownership_graph(&conn, root, depth)
     }
 
     pub fn unresolved(&self, limit: usize) -> Result<Vec<UnresolvedRow>, IdxError> {
@@ -320,16 +321,22 @@ impl Investor {
             for draft in drafts {
                 let ticker_id =
                     db::upsert_ticker(&conn, &draft.ticker_code, draft.issuer_name.as_deref())?;
-                let entity_id = entities::resolve_entity(
-                    &conn,
-                    &draft.raw_investor_name,
-                    OwnershipSource::Ksei,
-                )?;
+                // Archive totals per investor type are not investors: no
+                // entity or alias, so nothing can mistake them for one.
+                let entity_id = if is_aggregate_holder(&draft.raw_investor_name) {
+                    None
+                } else {
+                    Some(entities::resolve_entity(
+                        &conn,
+                        &draft.raw_investor_name,
+                        OwnershipSource::Ksei,
+                    )?)
+                };
                 ticker_ids.insert(ticker_id);
                 holdings.push(KseiHolding {
                     id: 0,
                     ticker_id,
-                    entity_id: Some(entity_id),
+                    entity_id,
                     raw_investor_name: draft.raw_investor_name,
                     investor_type: draft.investor_type,
                     locality: draft.locality,
