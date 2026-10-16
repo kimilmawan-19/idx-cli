@@ -83,4 +83,11 @@ Without `--force`, sync behaves conservatively:
 - local DB newer than snapshot: no-op and keep local data
 - local DB diverges at the same latest date: no-op and require `--force`
 
+These comparisons do not look at what a release holds. A local KSEI archive
+(aggregate rows only, see `docs/ARCHITECTURE.md`, "Release kinds") counts like
+any other release: one newer than the snapshot gives the "newer" no-op, and one
+at the snapshot's latest date gives the "diverges" no-op, which `--force`
+resolves by replacing the whole database. Published snapshots never contain
+archives; the publisher imports only XLSX/PDF reports.
+
 Replacement is staged through a temp file and validated before the local DB is swapped in.

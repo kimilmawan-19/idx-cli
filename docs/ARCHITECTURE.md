@@ -105,7 +105,7 @@ Unlike the `stocks` module (live-fetch), ownership is **import-then-query**:
 
 ### Data Sources
 - **KSEI** — official ≥1% shareholder registry, published monthly by IDX. Through May 2026 it was a PDF announcement; from the 2026-05-29 report onward it is an XLSX workbook on the IDX "Data Kepemilikan Saham" page
-- **KSEI archive** — monthly ZIP/TXT balance-position matrix, used as a local fallback/backstop import path
+- **KSEI archive** — monthly ZIP/TXT balance-position matrix: totals per investor type and locality, not holders. A local fallback/backstop import path; see [Release kinds](#release-kinds)
 - **Bing Finance** — global institutional ownership. The schema, `--source bing`
   queries, and `crates/idx-core/src/api/msn/bing.rs` exist, but `ownership import --fetch-bing`
   is intentionally unsupported, so no ingest path populates Bing rows today
@@ -137,8 +137,8 @@ KSEI PDF → mutool stext (XML with coordinates) → quick-xml parse → KseiRaw
   → SQLite INSERT (within transaction)
 
 KSEI archive ZIP/TXT → pipe-delimited balance-position rows
-  → map investor-type/locality buckets into synthetic aggregate holders
-  → SQLite INSERT (within transaction)
+  → map investor-type/locality buckets into aggregate rows ("KSEI AGGREGATE LOCAL CP", ...)
+  → SQLite INSERT (within transaction; no entity or alias is created)
 ```
 
 ## Data Flow Patterns
@@ -150,9 +150,37 @@ CLI args → resolve symbol → provider.quote/history/fundamentals → render t
 
 ### Import-Query (ownership module)
 ```
-Import: XLSX/PDF/archive → parse → normalize → resolve entities → SQLite INSERT
+Import: XLSX/PDF → parse → normalize → resolve entities → SQLite INSERT
+        archive    → parse → aggregate rows (no entities)  → SQLite INSERT
 Query:  CLI args → SQLite SELECT → render table/json (no network)
 ```
+
+### Release kinds
+A KSEI release is either a **register** (named holders above 1%: XLSX or PDF)
+or an **archive** (aggregate rows only). The kind is not stored, because a
+schema change would have to rewrite installed snapshots, whose file hash sync
+compares. It is derived from the rows: a release with a non-aggregate row is a
+register, one with only aggregate rows is an archive, and one with no rows is
+neither. An aggregate row is one whose `raw_investor_name` starts with
+`AGGREGATE_HOLDER_PREFIX` (`ownership/types.rs`); `db::sql_not_aggregate`
+is the one SQL form of the check (`GLOB`, since `LIKE` ignores case).
+
+- `ticker` lists the newest register. Only a database with no register at all
+  falls back to the newest archive, and then `ksei_aggregate` is true. An
+  archive never shadows a register, not even a newer one (`newer_aggregate_as_of`
+  says so). Rows and concentration of an archive-only `ticker` are unchanged.
+- `entity`, `cross-holders`, `concentration` and `graph` use the newest register
+  only. With archives but no register they fail with `NOMARKETDATA` instead of
+  returning something that looks like data; with no releases at all they keep
+  their usual empty answers.
+- `changes` compares registers with registers and archives with archives
+  (per date the newest import of that kind). A register date against an archive
+  date is `INVALIDINPUT`.
+- `search`, entity lookups, graph roots and `resolve map|merge` ignore or reject
+  aggregate names. Databases whose earlier imports created entities for them are
+  covered by these read-side filters; `import --force` of the archive rewrites
+  its month without the links.
+- `releases` and `status` list every release and show no kind.
 
 ## Configuration Precedence
 ```
