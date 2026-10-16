@@ -20,6 +20,21 @@ pub enum Locality {
     Foreign,
 }
 
+/// Name prefix of the synthetic holders a KSEI archive import creates.
+///
+/// A KSEI archive (`BalanceposEfek*.zip|txt`) totals holdings per investor
+/// type and locality; each total is stored as one pseudo-holder named
+/// `KSEI AGGREGATE {LOCAL|FOREIGN} {type}`. They are not investors: entity
+/// lookups, graphs, cross-holder rankings and concentration metrics must not
+/// treat them as such. Keep every check on this one definition.
+pub const AGGREGATE_HOLDER_PREFIX: &str = "KSEI AGGREGATE ";
+
+/// Whether `name` is one of the synthetic aggregate holders. The match is
+/// exact: capitals, and the trailing space of the prefix.
+pub fn is_aggregate_holder(name: &str) -> bool {
+    name.starts_with(AGGREGATE_HOLDER_PREFIX)
+}
+
 /// Bing institutional flow signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
